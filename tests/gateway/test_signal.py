@@ -79,6 +79,64 @@ class TestSignalAdapterInit:
         assert adapter.account == "+15551234567"
         assert "group123" in adapter.group_allow_from
 
+    @pytest.mark.asyncio
+    async def test_group_trigger_alias_is_case_insensitive_and_stripped(self, monkeypatch):
+        monkeypatch.setenv("SIGNAL_GROUP_TRIGGER_ALIASES", "Eris")
+        adapter = _make_signal_adapter(
+            monkeypatch,
+            account="bot-account",
+            group_allowed="group123",
+            require_mention=True,
+        )
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture
+        await adapter._handle_envelope({
+            "envelope": {
+                "sourceNumber": "group-member",
+                "sourceName": "Group member",
+                "timestamp": 1234567890000,
+                "dataMessage": {
+                    "message": "@eRiS bitte antworte",
+                    "groupInfo": {"groupId": "group123", "groupName": "Test Group"},
+                },
+            }
+        })
+
+        assert len(captured) == 1
+        assert captured[0].text == "bitte antworte"
+
+    @pytest.mark.asyncio
+    async def test_group_trigger_alias_requires_token_boundary(self, monkeypatch):
+        monkeypatch.setenv("SIGNAL_GROUP_TRIGGER_ALIASES", "Eris")
+        adapter = _make_signal_adapter(
+            monkeypatch,
+            account="bot-account",
+            group_allowed="group123",
+            require_mention=True,
+        )
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture
+        await adapter._handle_envelope({
+            "envelope": {
+                "sourceNumber": "group-member",
+                "timestamp": 1234567890000,
+                "dataMessage": {
+                    "message": "@erisx soll nicht triggern",
+                    "groupInfo": {"groupId": "group123", "groupName": "Test Group"},
+                },
+            }
+        })
+
+        assert captured == []
+
 
 class TestSignalConnectCleanup:
     """Regression coverage for failed connect() cleanup."""
@@ -349,6 +407,65 @@ class TestSignalAuthorization:
         with patch.dict("os.environ", {}, clear=True):
             result = gw._is_user_authorized(source)
             assert result is False
+
+    def test_allowed_signal_group_authorizes_its_members(self):
+        """SIGNAL_GROUP_ALLOWED_USERS contains group IDs despite its legacy name."""
+        from gateway.run import GatewayRunner
+        from gateway.config import GatewayConfig
+        from gateway.session import SessionSource
+
+        gw = GatewayRunner.__new__(GatewayRunner)
+        gw.config = GatewayConfig()
+        gw.pairing_store = MagicMock()
+        gw.pairing_store.is_approved.return_value = False
+
+        source = SessionSource(
+            platform=Platform.SIGNAL,
+            chat_id="group:group123",
+            chat_type="group",
+            user_id="group-member",
+            user_name="Group member",
+            chat_id_alt="group123",
+        )
+
+        with patch.dict(
+            "os.environ",
+            {
+                "SIGNAL_ALLOWED_USERS": "owner-id",
+                "SIGNAL_GROUP_ALLOWED_USERS": "group123",
+            },
+            clear=True,
+        ):
+            assert gw._is_user_authorized(source) is True
+
+    def test_unlisted_signal_group_remains_denied(self):
+        from gateway.run import GatewayRunner
+        from gateway.config import GatewayConfig
+        from gateway.session import SessionSource
+
+        gw = GatewayRunner.__new__(GatewayRunner)
+        gw.config = GatewayConfig()
+        gw.pairing_store = MagicMock()
+        gw.pairing_store.is_approved.return_value = False
+
+        source = SessionSource(
+            platform=Platform.SIGNAL,
+            chat_id="group:group123",
+            chat_type="group",
+            user_id="group-member",
+            user_name="Group member",
+            chat_id_alt="group123",
+        )
+
+        with patch.dict(
+            "os.environ",
+            {
+                "SIGNAL_ALLOWED_USERS": "owner-id",
+                "SIGNAL_GROUP_ALLOWED_USERS": "different-group",
+            },
+            clear=True,
+        ):
+            assert gw._is_user_authorized(source) is False
 
 
 # ---------------------------------------------------------------------------

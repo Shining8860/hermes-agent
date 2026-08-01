@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import random
+import re
 import shutil
 import subprocess
 import tempfile
@@ -278,6 +279,30 @@ class SignalAdapter(BasePlatformAdapter):
             self.require_mention = bool(_rm_cfg)
         else:
             self.require_mention = os.getenv("SIGNAL_REQUIRE_MENTION", "false").lower() in ("true", "1", "yes", "on")
+
+        # Optional textual group triggers for installations where Signal's
+        # native mention targets the linked account rather than the bot persona.
+        # Aliases are case-insensitive and matched as complete @tokens so
+        # "@eris" triggers while "@erisx" does not.
+        _alias_cfg = extra.get("group_trigger_aliases")
+        if _alias_cfg is None:
+            _alias_cfg = os.getenv("SIGNAL_GROUP_TRIGGER_ALIASES", "")
+        if isinstance(_alias_cfg, str):
+            aliases = _parse_comma_list(_alias_cfg)
+        else:
+            aliases = [str(alias).strip() for alias in (_alias_cfg or []) if str(alias).strip()]
+        aliases = [alias.lstrip("@").strip() for alias in aliases if alias.lstrip("@").strip()]
+        self.group_trigger_aliases = tuple(aliases)
+        self._group_trigger_pattern = (
+            re.compile(
+                r"(?<![\w@])@(?:"
+                + "|".join(re.escape(alias) for alias in sorted(aliases, key=len, reverse=True))
+                + r")(?!\w)",
+                re.IGNORECASE,
+            )
+            if aliases
+            else None
+        )
 
         # DM allowlist — mirrors SIGNAL_ALLOWED_USERS checked by run.py.
         # Stored here so the reaction hooks can skip unauthorized senders
@@ -619,7 +644,8 @@ class SignalAdapter(BasePlatformAdapter):
         if text and mentions:
             text = _render_mentions(text, mentions)
 
-        # Mention filter: in groups, only process messages that @mention the bot account
+        # Mention filter: in groups, process native bot mentions or configured
+        # textual persona aliases such as @eris.
         if is_group and self.require_mention:
             account_norm = self._account_normalized
             # Check rendered mention tags OR raw mention metadata
@@ -630,7 +656,11 @@ class SignalAdapter(BasePlatformAdapter):
                 m.get("number") == account_norm or m.get("uuid") == account_norm
                 for m in (data_message.get("mentions") or [])
             )
-            if not mentioned_in_text and not mentioned_in_metadata:
+            mentioned_by_alias = bool(
+                self._group_trigger_pattern
+                and self._group_trigger_pattern.search(text or "")
+            )
+            if not mentioned_in_text and not mentioned_in_metadata and not mentioned_by_alias:
                 logger.debug(
                     "Signal: ignoring group message (require_mention=true, bot not mentioned)"
                 )
@@ -651,11 +681,11 @@ class SignalAdapter(BasePlatformAdapter):
                 bot_uuid = self._recipient_uuid_by_number.get(account_norm)
                 if bot_uuid:
                     text = text.replace(f"@{bot_uuid}", "")
-                # Tidy the spacing the removed mention left behind: collapse the
-                # double-space at a mid-sentence removal and trim the ends.
-                # Only touches the doubled space the removal introduced, so
-                # intentional newlines in a multi-line message are preserved.
-                text = text.replace("  ", " ").strip()
+            if self._group_trigger_pattern:
+                text = self._group_trigger_pattern.sub("", text)
+            # Tidy the spacing a removed mention left behind. Only collapse
+            # doubled spaces so intentional newlines remain intact.
+            text = text.replace("  ", " ").strip()
 
         # Extract quote (reply-to) context from Signal dataMessage. Signal's
         # quote.id is the timestamp of the quoted message; quote.author points
