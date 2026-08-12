@@ -681,8 +681,6 @@ class SignalAdapter(BasePlatformAdapter):
                 bot_uuid = self._recipient_uuid_by_number.get(account_norm)
                 if bot_uuid:
                     text = text.replace(f"@{bot_uuid}", "")
-            if self._group_trigger_pattern:
-                text = self._group_trigger_pattern.sub("", text)
             # Tidy the spacing a removed mention left behind. Only collapse
             # doubled spaces so intentional newlines remain intact.
             text = text.replace("  ", " ").strip()

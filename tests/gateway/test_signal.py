@@ -80,7 +80,7 @@ class TestSignalAdapterInit:
         assert "group123" in adapter.group_allow_from
 
     @pytest.mark.asyncio
-    async def test_group_trigger_alias_is_case_insensitive_and_stripped(self, monkeypatch):
+    async def test_group_trigger_alias_is_case_insensitive_and_preserved(self, monkeypatch):
         monkeypatch.setenv("SIGNAL_GROUP_TRIGGER_ALIASES", "Eris")
         adapter = _make_signal_adapter(
             monkeypatch,
@@ -107,7 +107,7 @@ class TestSignalAdapterInit:
         })
 
         assert len(captured) == 1
-        assert captured[0].text == "bitte antworte"
+        assert captured[0].text == "@eRiS bitte antworte"
 
     @pytest.mark.asyncio
     async def test_group_trigger_alias_requires_token_boundary(self, monkeypatch):
