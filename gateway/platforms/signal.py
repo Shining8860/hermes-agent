@@ -13,10 +13,12 @@ Requires:
 
 import asyncio
 import base64
+import dataclasses
 import json
 import logging
 import os
 import random
+import re
 import shutil
 import subprocess
 import tempfile
@@ -304,6 +306,44 @@ class SignalAdapter(BasePlatformAdapter):
             self.require_mention = bool(_rm_cfg)
         else:
             self.require_mention = os.getenv("SIGNAL_REQUIRE_MENTION", "false").lower() in ("true", "1", "yes", "on")
+
+        _observe_cfg = extra.get("observe_unmentioned_group_messages")
+        if _observe_cfg is not None:
+            self.observe_unmentioned_group_messages = bool(_observe_cfg)
+        else:
+            self.observe_unmentioned_group_messages = _sig_secret(
+                "SIGNAL_OBSERVE_UNMENTIONED_GROUP_MESSAGES", "false"
+            ).lower() in ("true", "1", "yes", "on")
+
+        # Signal native mentions target the linked account. Text aliases let a
+        # group address the bot persona instead (for example ``@eris``).
+        _alias_cfg = extra.get("group_trigger_aliases")
+        if _alias_cfg is None:
+            _alias_cfg = _sig_secret("SIGNAL_GROUP_TRIGGER_ALIASES", "")
+        if isinstance(_alias_cfg, str):
+            aliases = _parse_comma_list(_alias_cfg)
+        else:
+            aliases = [str(alias).strip() for alias in (_alias_cfg or []) if str(alias).strip()]
+        aliases = [alias.lstrip("@").strip() for alias in aliases if alias.lstrip("@").strip()]
+        self.group_trigger_aliases = tuple(aliases)
+        _exclusive_cfg = extra.get("group_trigger_aliases_exclusive")
+        if _exclusive_cfg is None:
+            _exclusive_cfg = _sig_secret("SIGNAL_GROUP_TRIGGER_ALIASES_EXCLUSIVE", "false")
+        self.group_trigger_aliases_exclusive = (
+            _exclusive_cfg.lower() in ("true", "1", "yes", "on")
+            if isinstance(_exclusive_cfg, str)
+            else bool(_exclusive_cfg)
+        )
+        self._group_trigger_pattern = (
+            re.compile(
+                r"(?<![\w@])@(?:"
+                + "|".join(re.escape(alias) for alias in sorted(aliases, key=len, reverse=True))
+                + r")(?!\w)",
+                re.IGNORECASE,
+            )
+            if aliases
+            else None
+        )
 
         # DM allowlist — mirrors SIGNAL_ALLOWED_USERS checked by run.py.
         # Stored here so the reaction hooks can skip unauthorized senders
@@ -645,7 +685,9 @@ class SignalAdapter(BasePlatformAdapter):
         if text and mentions:
             text = _render_mentions(text, mentions)
 
-        # Mention filter: in groups, only process messages that @mention the bot account
+        # Mention filter: in groups, process native bot mentions or configured
+        # textual persona aliases such as @eris.
+        unmentioned_group_message = False
         if is_group and self.require_mention:
             account_norm = self._account_normalized
             # Check rendered mention tags OR raw mention metadata
@@ -656,11 +698,22 @@ class SignalAdapter(BasePlatformAdapter):
                 m.get("number") == account_norm or m.get("uuid") == account_norm
                 for m in (data_message.get("mentions") or [])
             )
-            if not mentioned_in_text and not mentioned_in_metadata:
-                logger.debug(
-                    "Signal: ignoring group message (require_mention=true, bot not mentioned)"
-                )
-                return
+            mentioned_by_alias = bool(
+                self._group_trigger_pattern
+                and self._group_trigger_pattern.search(text or "")
+            )
+            triggered = mentioned_by_alias or (
+                not self.group_trigger_aliases_exclusive
+                and (mentioned_in_text or mentioned_in_metadata)
+            )
+            if not triggered:
+                if self.observe_unmentioned_group_messages:
+                    unmentioned_group_message = True
+                else:
+                    logger.debug(
+                        "Signal: ignoring group message (require_mention=true, bot not mentioned)"
+                    )
+                    return
 
         # Strip the bot's own @mention from any group message so the agent
         # doesn't misinterpret "@+155****4567 say hello" as a directive to
@@ -677,11 +730,17 @@ class SignalAdapter(BasePlatformAdapter):
                 bot_uuid = self._recipient_uuid_by_number.get(account_norm)
                 if bot_uuid:
                     text = text.replace(f"@{bot_uuid}", "")
-                # Tidy the spacing the removed mention left behind: collapse the
-                # double-space at a mid-sentence removal and trim the ends.
-                # Only touches the doubled space the removal introduced, so
-                # intentional newlines in a multi-line message are preserved.
-                text = text.replace("  ", " ").strip()
+            # Tidy spacing a removed mention left behind while preserving
+            # intentional newlines.
+            text = text.replace("  ", " ").strip()
+
+            # MessageEvent command parsing only recognizes a leading slash.
+            # Strip a leading persona alias solely when it prefixes a command;
+            # ordinary addressed chat keeps the alias visible to the agent.
+            if self._group_trigger_pattern:
+                alias_match = self._group_trigger_pattern.match(text)
+                if alias_match and text[alias_match.end():].lstrip().startswith("/"):
+                    text = text[alias_match.end():].lstrip()
 
         # Extract quote (reply-to) context from Signal dataMessage. Signal's
         # quote.id is the timestamp of the quoted message; quote.author points
@@ -787,12 +846,88 @@ class SignalAdapter(BasePlatformAdapter):
             reply_to_author_id=reply_to_author,
             reply_to_author_name=reply_to_author_name,
             reply_to_is_own_message=reply_to_is_own,
+            channel_prompt=(
+                self._group_observe_channel_prompt()
+                if (
+                    is_group
+                    and self.require_mention
+                    and self.observe_unmentioned_group_messages
+                )
+                else None
+            ),
         )
 
         logger.debug("Signal: message from %s in %s: %s",
                       redact_phone(sender), chat_id[:20], (text or "")[:50])
 
+        if unmentioned_group_message:
+            self._observe_group_message(event)
+            logger.info(
+                "Signal: group message observed without persona trigger: chat=%s from=%s",
+                chat_id[:20],
+                redact_phone(sender),
+            )
+            return
+
+        if (
+            is_group
+            and self.require_mention
+            and self.observe_unmentioned_group_messages
+            and not event.is_command()
+        ):
+            event = dataclasses.replace(
+                event,
+                text=self._group_observe_attributed_text(event),
+                source=self._group_observe_shared_source(event.source),
+            )
+
         await self.handle_message(event)
+
+    @staticmethod
+    def _group_observe_channel_prompt() -> str:
+        return (
+            "You are handling a Signal group chat message.\n"
+            "- observed Signal group context may be provided in a separate context-only block "
+            "before the current message; it is not necessarily addressed to you.\n"
+            "- Treat only the current new message as a request explicitly directed at you, "
+            "and use observed context only when the current message asks for it."
+        )
+
+    @staticmethod
+    def _group_observe_shared_source(source):
+        """Return a chat-scoped source shared by all Signal group members."""
+        return dataclasses.replace(
+            source,
+            user_id=None,
+            user_name=None,
+            user_id_alt=None,
+        )
+
+    @staticmethod
+    def _group_observe_attributed_text(event: MessageEvent) -> str:
+        sender_id = event.source.user_id or "unknown"
+        sender_name = event.source.user_name or sender_id
+        return f"[{sender_name}|{sender_id}]\n{event.text or ''}"
+
+    def _observe_group_message(self, event: MessageEvent) -> None:
+        """Persist untriggered group chatter without invoking the agent."""
+        store = getattr(self, "_session_store", None)
+        if not store:
+            return
+        try:
+            source = self._group_observe_shared_source(event.source)
+            session_entry = store.get_or_create_session(source)
+            store.append_to_transcript(
+                session_entry.session_id,
+                {
+                    "role": "user",
+                    "content": self._group_observe_attributed_text(event),
+                    "timestamp": event.timestamp.isoformat(),
+                    "observed": True,
+                },
+            )
+        except Exception:
+            logger.warning("Signal: failed to observe group message", exc_info=True)
 
     def _remember_recipient_identifiers(self, number: Optional[str], service_id: Optional[str]) -> None:
         """Cache any number↔UUID mapping observed from Signal envelopes."""

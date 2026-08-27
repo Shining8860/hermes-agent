@@ -3,6 +3,7 @@ import asyncio
 import base64
 import pytest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, AsyncMock
 from urllib.parse import quote
 
@@ -74,10 +75,164 @@ class TestSignalConfigLoading:
 
 class TestSignalAdapterInit:
     def test_init_parses_config(self, monkeypatch):
-        adapter = _make_signal_adapter(monkeypatch, group_allowed="group123,group456")
+        adapter = _make_signal_adapter(
+            monkeypatch,
+            account="test-account",
+            group_allowed="group123,group456",
+        )
         assert adapter.http_url == "http://localhost:8080"
-        assert adapter.account == "+15551234567"
+        assert adapter.account == "test-account"
         assert "group123" in adapter.group_allow_from
+
+    @pytest.mark.asyncio
+    async def test_group_trigger_alias_is_case_insensitive_and_preserved(self, monkeypatch):
+        monkeypatch.setenv("SIGNAL_GROUP_TRIGGER_ALIASES", "Eris")
+        adapter = _make_signal_adapter(
+            monkeypatch,
+            account="bot-account",
+            group_allowed="group123",
+            require_mention=True,
+        )
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture
+        await adapter._handle_envelope({
+            "envelope": {
+                "sourceNumber": "group-member",
+                "sourceName": "Group member",
+                "timestamp": 1234567890000,
+                "dataMessage": {
+                    "message": "@eRiS bitte antworte",
+                    "groupInfo": {"groupId": "group123", "groupName": "Test Group"},
+                },
+            }
+        })
+
+        assert len(captured) == 1
+        assert captured[0].text == "@eRiS bitte antworte"
+
+    @pytest.mark.asyncio
+    async def test_group_trigger_alias_requires_token_boundary(self, monkeypatch):
+        monkeypatch.setenv("SIGNAL_GROUP_TRIGGER_ALIASES", "Eris")
+        adapter = _make_signal_adapter(
+            monkeypatch,
+            account="bot-account",
+            group_allowed="group123",
+            require_mention=True,
+        )
+        adapter.handle_message = AsyncMock()
+
+        await adapter._handle_envelope({
+            "envelope": {
+                "sourceNumber": "group-member",
+                "timestamp": 1234567890000,
+                "dataMessage": {
+                    "message": "@erisx soll nicht triggern",
+                    "groupInfo": {"groupId": "group123", "groupName": "Test Group"},
+                },
+            }
+        })
+
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unmentioned_group_message_is_observed_without_dispatch(self, monkeypatch):
+        monkeypatch.setenv("SIGNAL_GROUP_TRIGGER_ALIASES", "Eris")
+        monkeypatch.setenv("SIGNAL_OBSERVE_UNMENTIONED_GROUP_MESSAGES", "true")
+        adapter = _make_signal_adapter(
+            monkeypatch,
+            account="bot-account",
+            group_allowed="group123",
+            require_mention=True,
+        )
+        adapter.handle_message = AsyncMock()
+        adapter._session_store = MagicMock()
+        adapter._session_store.get_or_create_session.return_value = SimpleNamespace(
+            session_id="signal-shared-session"
+        )
+
+        await adapter._handle_envelope({
+            "envelope": {
+                "sourceNumber": "group-member",
+                "sourceName": "Group member",
+                "timestamp": 1234567890000,
+                "dataMessage": {
+                    "message": "normale Nachricht ohne Eris-Mention",
+                    "groupInfo": {"groupId": "group123", "groupName": "Test Group"},
+                },
+            }
+        })
+
+        adapter.handle_message.assert_not_awaited()
+        adapter._session_store.append_to_transcript.assert_called_once()
+        _, observed = adapter._session_store.append_to_transcript.call_args.args
+        assert observed["observed"] is True
+        assert observed["content"] == (
+            "[Group member|group-member]\n"
+            "normale Nachricht ohne Eris-Mention"
+        )
+
+    @pytest.mark.asyncio
+    async def test_triggered_group_message_dispatches_with_observe_prompt(self, monkeypatch):
+        monkeypatch.setenv("SIGNAL_GROUP_TRIGGER_ALIASES", "Eris")
+        monkeypatch.setenv("SIGNAL_OBSERVE_UNMENTIONED_GROUP_MESSAGES", "true")
+        adapter = _make_signal_adapter(
+            monkeypatch,
+            account="bot-account",
+            group_allowed="group123",
+            require_mention=True,
+        )
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture
+        await adapter._handle_envelope({
+            "envelope": {
+                "sourceNumber": "group-member",
+                "sourceName": "Group member",
+                "timestamp": 1234567890000,
+                "dataMessage": {
+                    "message": "@eris was wurde gesagt?",
+                    "groupInfo": {"groupId": "group123", "groupName": "Test Group"},
+                },
+            }
+        })
+
+        assert len(captured) == 1
+        assert captured[0].text == "[Group member|group-member]\n@eris was wurde gesagt?"
+        assert captured[0].source.user_id is None
+        assert captured[0].source.user_name is None
+        assert "observed Signal group context" in captured[0].channel_prompt
+
+    def test_observed_signal_group_context_is_not_replayed_as_user_work(self):
+        from gateway.run import _build_gateway_agent_history
+
+        history = [
+            {
+                "role": "user",
+                "content": "[Alice|member-1]\nside chatter",
+                "observed": True,
+            },
+            {"role": "assistant", "content": "earlier addressed response"},
+        ]
+
+        agent_history, observed_context = _build_gateway_agent_history(
+            history,
+            channel_prompt=(
+                "observed Signal group context may be provided in a separate "
+                "context-only block"
+            ),
+        )
+
+        assert agent_history == [
+            {"role": "assistant", "content": "earlier addressed response"}
+        ]
+        assert observed_context == "[Alice|member-1]\nside chatter"
 
 
 class TestSignalConnectCleanup:
@@ -349,6 +504,27 @@ class TestSignalAuthorization:
         with patch.dict("os.environ", {}, clear=True):
             result = gw._is_user_authorized(source)
             assert result is False
+
+    @pytest.mark.parametrize("chat_id", ["group:group123", "group123"])
+    def test_allowed_signal_group_authorizes_by_group_id(self, monkeypatch, chat_id):
+        from gateway.run import GatewayRunner
+        from gateway.config import GatewayConfig
+
+        gw = GatewayRunner.__new__(GatewayRunner)
+        gw.config = GatewayConfig()
+        gw.pairing_store = MagicMock()
+        gw.pairing_store.is_approved.return_value = False
+
+        source = MagicMock()
+        source.platform = Platform.SIGNAL
+        source.chat_type = "group"
+        source.chat_id = chat_id
+        source.chat_id_alt = "group123"
+        source.user_id = None
+        source.delivered_via_upstream_relay = False
+
+        monkeypatch.setenv("SIGNAL_GROUP_ALLOWED_USERS", "group123")
+        assert gw._is_user_authorized(source) is True
 
 
 # ---------------------------------------------------------------------------
