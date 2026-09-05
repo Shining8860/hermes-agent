@@ -28,7 +28,12 @@ _TRUTHY = frozenset({"true", "1", "yes"})
 _ALLOWED_USERS_ENV = {Platform(k): v for k, v in _PLATFORM_ALLOWLIST_ENV.items()}
 _ALLOW_ALL_ENV = {p: v.replace("_ALLOWED_USERS", "_ALLOW_ALL_USERS") for p, v in _ALLOWED_USERS_ENV.items()}
 _GROUP_USER_ENV = {Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_USERS"}
-_GROUP_CHAT_ENV = {Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_CHATS", Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS"}
+_GROUP_CHAT_ENV = {
+    Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_CHATS",
+    Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS",
+    # Historical name notwithstanding, Signal stores group IDs here, not sender IDs.
+    Platform.SIGNAL: "SIGNAL_GROUP_ALLOWED_USERS",
+}
 _ALLOW_BOTS_ENV = {
     # Bots admitted by {PLATFORM}_ALLOW_BOTS bypass the human allowlist (#4466). Checked before the
     # no-user-id guard below: some platforms deliver bot/automation traffic with no user_id at all -- e.g.
@@ -436,8 +441,15 @@ class GatewayAuthorizationMixin:
         # sender_chat posts, channel broadcasts).
         if is_group and source.chat_id:
             chat_allowlist_env = _GROUP_CHAT_ENV.get(source.platform, "")
-            if chat_allowlist_env and _allows(_coerce_allow_set(_platform_gate_env(chat_allowlist_env)), source.chat_id):
-                return True
+            if chat_allowlist_env:
+                allowed_chat_ids = _coerce_allow_set(_platform_gate_env(chat_allowlist_env))
+                candidate_chat_ids = {source.chat_id}
+                if chat_id_alt := getattr(source, "chat_id_alt", None):
+                    candidate_chat_ids.add(chat_id_alt)
+                if source.platform == Platform.SIGNAL and source.chat_id.startswith("group:"):
+                    candidate_chat_ids.add(source.chat_id.removeprefix("group:"))
+                if "*" in allowed_chat_ids or candidate_chat_ids & allowed_chat_ids:
+                    return True
             # config.yaml fallback (``extra.group_allowed_chats``): Telegram observe-unmentioned mode
             # strips user_id, so the env-only check above misses it.
             with contextlib.suppress(Exception):
