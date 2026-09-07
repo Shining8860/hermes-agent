@@ -784,7 +784,7 @@ class TestSignalInboundMessageTypeClassification:
     @pytest.mark.asyncio
     async def test_pdf_attachment_sets_document_type(self, monkeypatch):
         """A PDF attachment (application/pdf) must produce MessageType.DOCUMENT, not TEXT."""
-        from gateway.platforms.base import MessageType
+        from gateway.platforms.event import MessageType
 
         event = await self._dispatch_single_attachment(
             monkeypatch,
@@ -803,7 +803,7 @@ class TestSignalInboundMessageTypeClassification:
     @pytest.mark.asyncio
     async def test_text_plain_attachment_sets_document_type(self, monkeypatch):
         """A text/plain attachment must produce MessageType.DOCUMENT, not TEXT."""
-        from gateway.platforms.base import MessageType
+        from gateway.platforms.event import MessageType
 
         event = await self._dispatch_single_attachment(
             monkeypatch,
