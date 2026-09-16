@@ -2751,6 +2751,16 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
             mcp_names = set((CLI_CONFIG.get("mcp_servers") or {}).keys())
             invalid = [t for t in toolsets if not validate_toolset(t) and t not in mcp_names]
             if invalid:
+                # Plugin toolsets are registered during discovery. Retry validation after
+                # discovery before calling them unknown, matching the TUI startup path.
+                try:
+                    from hermes_cli.plugins import discover_plugins
+
+                    discover_plugins()
+                except Exception:
+                    logger.debug("Plugin discovery failed during toolset validation", exc_info=True)
+                invalid = [t for t in toolsets if not validate_toolset(t) and t not in mcp_names]
+            if invalid:
                 self._console_print(f"[bold red]Warning: Unknown toolsets: {', '.join(invalid)}[/]")
 
     def _init_checkpoints_and_rules(self, checkpoints, pass_session_id, ignore_rules):
