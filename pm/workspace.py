@@ -322,8 +322,16 @@ def _workspace_member(plugin_dir: Path, root: Path, *, identity: Path) -> Path:
         # tool.uv.package = true opts into uv package mode: real build metadata, so buildable.
         virtual = "build-system" not in document and document.get("tool", {}).get("uv", {}).get("package") is not True
         changed = declaration.install_requirements != declaration.requirements
+        if virtual:
+            project = document.setdefault("project", {})
+            project["name"] = f"hermes-plugin-{key}"
+            # A pyproject used only for lint/tool settings has no package
+            # metadata. Once copied into uv's workspace it still needs to be a
+            # syntactically valid virtual project.
+            project.setdefault("version", "0.0.0")
+            project.setdefault("requires-python", ">=3.11")
         if changed:
-            document["project"]["dependencies"] = list(declaration.install_requirements)
+            document.setdefault("project", {})["dependencies"] = list(declaration.install_requirements)
         for sources in document.get("tool", {}).get("uv", {}).get("sources", {}).values():
             for spec in sources if isinstance(sources, list) else [sources]:
                 if not isinstance(spec, dict) or "path" not in spec:
@@ -336,8 +344,6 @@ def _workspace_member(plugin_dir: Path, root: Path, *, identity: Path) -> Path:
                     continue  # The referenced tree was copied with this member.
                 spec["path"] = (identity / relative).resolve().as_posix()
                 changed = True
-        if virtual:
-            document.setdefault("project", {})["name"] = f"hermes-plugin-{key}"
         if virtual or changed:
             import tomli_w
 

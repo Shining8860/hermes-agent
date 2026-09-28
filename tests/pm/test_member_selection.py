@@ -71,6 +71,26 @@ def test_pyproject_member_is_renamed_by_its_key_and_stays_unique(tmp_path):
     assert document["project"]["dependencies"] == ["hindsight-client>=0.10.1"]
 
 
+def test_tooling_only_pyproject_becomes_a_valid_virtual_member(tmp_path):
+    import tomllib
+    from pm.workspace import _workspace_member
+
+    plugin = tmp_path / "home" / "plugins" / "tooling-only"
+    plugin.mkdir(parents=True)
+    (plugin / "pyproject.toml").write_text(
+        '[tool.ruff]\ntarget-version = "py311"\n', encoding="utf-8"
+    )
+    root = tmp_path / "generation"
+    root.mkdir()
+
+    member = _workspace_member(plugin, root, identity=plugin)
+    document = tomllib.loads((member / "pyproject.toml").read_text(encoding="utf-8"))
+    assert document["project"]["name"].startswith("hermes-plugin-tooling-only-")
+    assert document["project"]["version"] == "0.0.0"
+    assert document["project"]["requires-python"] == ">=3.11"
+    assert document["tool"]["ruff"]["target-version"] == "py311"
+
+
 def test_buildable_pyproject_member_keeps_its_declared_name(tmp_path):
     """uv verifies a buildable member's [project].name against the package metadata
     its backend produces, so renaming it breaks the build ("Package metadata name
