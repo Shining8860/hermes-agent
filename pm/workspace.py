@@ -62,6 +62,59 @@ def members_stamp(plugin_dirs) -> str:
     return h.hexdigest()
 
 
+def _member_content_stamp(entry: Path) -> str:
+    """Hash one copied plugin tree without including its profile-local path."""
+    h = hashlib.sha256()
+    for directory, dirs, files in os.walk(entry):
+        dirs[:] = sorted(set(dirs) - set(_member_ignored(directory, dirs)))
+        for name in sorted(set(files) - set(_member_ignored(directory, files))):
+            path = Path(directory) / name
+            h.update(path.relative_to(entry).as_posix().encode())
+            h.update(b"\0")
+            h.update(os.readlink(path).encode() if path.is_symlink() else path.read_bytes())
+            h.update(b"\0")
+    return h.hexdigest()
+
+
+def _deduplicate_buildable_members(entries: Mapping[Path, Path]) -> list[tuple[Path, Path]]:
+    """Collapse byte-identical buildable plugins enabled in several profiles.
+
+    uv rejects multiple workspace members with the same project name. Profile-local
+    clones of one plugin are valid inputs, but divergent clones are ambiguous and
+    must fail closed instead of selecting one silently.
+    """
+    import re
+    import tomllib
+
+    selected: list[tuple[Path, Path]] = []
+    buildable: dict[str, tuple[str, Path]] = {}
+    for identity, source in entries.items():
+        declaration = read_python_declaration(source)
+        pyproject = declaration.pyproject
+        if pyproject is None:
+            selected.append((identity, source))
+            continue
+        document = tomllib.loads(pyproject.read_text(encoding="utf-8-sig"))
+        is_buildable = ("build-system" in document
+                        or document.get("tool", {}).get("uv", {}).get("package") is True)
+        name = document.get("project", {}).get("name")
+        if not is_buildable or not isinstance(name, str) or not name.strip():
+            selected.append((identity, source))
+            continue
+        normalized = re.sub(r"[-_.]+", "-", name).lower()
+        stamp = _member_content_stamp(source)
+        prior = buildable.get(normalized)
+        if prior is None:
+            buildable[normalized] = (stamp, identity)
+            selected.append((identity, source))
+        elif prior[0] != stamp:
+            raise InstallError(
+                "venv",
+                f"buildable plugin {name!r} differs across profiles: {prior[1]} and {identity}",
+            )
+    return selected
+
+
 def _copy_core_inputs(source: Path, destination: Path) -> None:
     """Build from a writable snapshot, never from signed/read-only source."""
     import fnmatch
@@ -119,9 +172,11 @@ def _generate_pyproject(plugin_dirs: list[Path] | Mapping[Path, Path], root: Pat
     core_pyproject = source / "pyproject.toml"
     core_text = core_pyproject.read_text(encoding="utf-8-sig")
 
-    members = [_workspace_member(source, root, identity=identity).relative_to(root).as_posix()
-               for identity, source in member_sources(plugin_dirs).items()
-               if _is_member_candidate(source)]
+    candidates = {identity: plugin_source
+                  for identity, plugin_source in member_sources(plugin_dirs).items()
+                  if _is_member_candidate(plugin_source)}
+    members = [_workspace_member(plugin_source, root, identity=identity).relative_to(root).as_posix()
+               for identity, plugin_source in _deduplicate_buildable_members(candidates)]
 
     if members:
         import tomllib
