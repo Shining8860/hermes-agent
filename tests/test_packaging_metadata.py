@@ -1,6 +1,7 @@
 """Independent core/optional dependency and reviewed CVE policies."""
 import tomllib
 from pathlib import Path
+import re
 
 from packaging.requirements import Requirement
 from packaging.version import Version
@@ -51,3 +52,27 @@ def test_starlette_server_pins_and_lock_exclude_cve_2026_48710():
     assert len(pins) == 1 and pins[0].operator == "==" and Version(pins[0].version) >= floor
     versions = [Version(row["version"]) for row in lock["package"] if row["name"] == "starlette"]
     assert versions and all(version >= floor for version in versions)
+
+
+def test_exact_pinned_deps_exempt_from_exclude_newer():
+    """An exact pin cannot float, so a release cutoff adds only mirror/install risk."""
+    metadata = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    requirements = list(metadata["project"]["dependencies"])
+    for values in metadata["project"]["optional-dependencies"].values():
+        requirements.extend(values)
+    for values in metadata["dependency-groups"].values():
+        requirements.extend(values)
+    requirements.extend(metadata["build-system"]["requires"])
+
+    def normalized(name: str) -> str:
+        return re.sub(r"[-_.]+", "-", name).lower()
+
+    policy = {normalized(name): value for name, value in
+              metadata["tool"]["uv"]["exclude-newer-package"].items()}
+    exact = set()
+    for raw in requirements:
+        requirement = Requirement(raw)
+        specs = list(requirement.specifier)
+        if len(specs) == 1 and specs[0].operator == "==" and "*" not in specs[0].version:
+            exact.add(normalized(requirement.name))
+    assert {name for name in exact if policy.get(name) is not False} == set()
