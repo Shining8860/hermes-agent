@@ -235,6 +235,7 @@ def _job_rows(job: Dict[str, Any]) -> List[tuple[str, str]]:
         ("Mode", color("no-agent", Colors.DIM) + " (script stdout delivered directly)"
          if job.get("no_agent") else ""),
         ("Workdir", job.get("workdir")),
+        ("Python", job.get("interpreter")),
         ("Last run", f"{job.get('last_run_at', '?')}  {_last_run_display(job)}"
          if job.get("last_status") else ""),
         ("Dispatch", _dispatch_display(job.get("last_dispatch"))),
@@ -516,13 +517,10 @@ def cron_status():
                   "    sudo hermes --profile default gateway install --system  # Linux servers: boot-time service\n"
                   "    hermes --profile default gateway run       # Or run in foreground")
             if active not in ("default", "custom"):
-                print("\n  Then make sure it serves this profile:\n"
-                      "      hermes --profile default config set gateway.multiplex_profiles true\n"
-                      "      hermes --profile default gateway restart\n"
-                      "    To fold existing per-profile services into it, with preflight checks:\n"
+                print("\n  It serves this profile automatically. If a per-profile service or gateway\n"
+                      "  from an older release is still installed, fold it in (preflight + dry run):\n"
+                      "      hermes --profile default gateway migrate --multiplex --dry-run\n"
                       "      hermes --profile default gateway migrate --multiplex\n"
-                      "  LEGACY (pre-multiplex topology, not recommended): a per-profile service via\n"
-                      "      hermes gateway install   # starts a SECOND gateway process on this host\n"
                       "  Check: hermes cron status from this profile should show its ticker heartbeat.\n")
 
     print()
@@ -674,7 +672,8 @@ _JOB_ARG_FIELDS = (("name", "name"), ("deliver", "deliver"), ("failure_deliver",
                    ("repeat", "repeat"), ("script", "script"), ("workdir", "workdir"),
                    ("model", "model"), ("provider", "model_provider"), ("pinned", "pinned"),
                    ("monitor_script", "monitor_script"), ("monitor_url", "monitor_url"),
-                   ("continuity", "continuity"), ("reasoning_effort", "reasoning_effort"))
+                   ("continuity", "continuity"), ("reasoning_effort", "reasoning_effort"),
+                   ("interpreter", "interpreter"))
 
 
 def _job_api_kwargs(args) -> Dict[str, Any]:
@@ -688,7 +687,8 @@ _JOB_DETAIL_LINES = (
     ("monitor_url", "  Monitor: {} (agent runs only on output change)"),
     ("no_agent", "  Mode: no-agent (script stdout delivered directly)"),
     ("continuity", "  Continuity: on (each run sees the previous run's output)"),
-    ("workdir", "  Workdir: {}"))
+    ("workdir", "  Workdir: {}"),
+    ("interpreter", "  Python: {}"))
 
 
 def _print_job_details(job_data: Dict[str, Any]) -> None:
