@@ -338,6 +338,13 @@ def test_launch_external_worker_uses_restart_safe_scope_and_acknowledges(
         wrapped_commands.append((command, unit_suffix))
         return GatewayChildDispatch("scoped", ["scope", "--", *command])
 
+    payload_python = tmp_path / "payload-python"
+    payload_python.touch()
+    monkeypatch.setattr(
+        "cron.scheduler_worker_env.external_worker_python",
+        lambda _repo_root: payload_python,
+    )
+
     monkeypatch.setattr(
         "tools.process_registry.restart_safe_gateway_child_argv", wrap
     )
@@ -354,6 +361,7 @@ def test_launch_external_worker_uses_restart_safe_scope_and_acknowledges(
         clear_env_passthrough()
         set_multiplex_active(False)
     assert wrapped_commands[0][1] == "cron-job-1-exec-exec-1"
+    assert wrapped_commands[0][0][0] == str(payload_python)
     assert spawned[0][0][0:2] == ["scope", "--"]
     assert spawned[0][1]["start_new_session"] is True
     assert "ANTHROPIC_API_KEY" not in spawned[0][1]["env"]

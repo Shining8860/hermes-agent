@@ -1,6 +1,6 @@
-"""Cron: import path of the restart-safe external worker.
+"""Cron: interpreter and import path of the restart-safe external worker.
 
-The worker is spawned as ``sys.executable -m cron.scheduler``. Its entry module is
+The worker is spawned as ``<payload-python> -m cron.scheduler``. Its entry module is
 ``cron.scheduler``, not ``hermes_cli.main``, so nothing bootstraps the gateway's checkout
 onto its ``sys.path``; historically it imported ``cron`` only through the implicit ``-m``
 cwd entry. That entry is gone under ``PYTHONSAFEPATH`` and useless when the venv's
@@ -16,8 +16,36 @@ site-packages, dropped venv markers) stand.
 from __future__ import annotations
 
 import os
+import sys
 import sysconfig
 from pathlib import Path
+
+
+def external_worker_python(repo_root: Path) -> Path:
+    """Return the interpreter for the dependency environment active on ``sys.path``.
+
+    A managed gateway starts on the bare store Python and ``hermes_bootstrap`` then adds
+    the immutable project's site-packages in-process.  A direct ``-m cron.scheduler`` child
+    has no such bootstrap, so inheriting ``sys.executable`` loses dependencies such as
+    ``ruamel.yaml`` before it can acknowledge ownership.  Deriving the venv from the active
+    site-packages also keeps source/legacy installs on their current interpreter and avoids
+    consulting mutable profile state.  ``repo_root`` remains explicit for the shared worker
+    API and future non-venv layouts.
+    """
+    del repo_root
+    for entry in sys.path:
+        path = Path(entry)
+        if path.name != "site-packages":
+            continue
+        if path.parent.name.lower() == "lib":  # Windows: <venv>/Lib/site-packages
+            candidate = path.parent.parent / "Scripts" / "python.exe"
+        elif path.parent.parent.name == "lib":  # POSIX: <venv>/lib/pythonX.Y/site-packages
+            candidate = path.parent.parent.parent / "bin" / "python"
+        else:
+            continue
+        if candidate.is_file():
+            return candidate
+    return Path(sys.executable)
 
 
 def _installed_purelib() -> Path | None:
