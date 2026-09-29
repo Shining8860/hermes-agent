@@ -230,6 +230,16 @@ class CLIInitMixin:
             invalid = [t for t in toolsets
                        if not validate_toolset(t) and t not in mcp_names and t not in plugin_ts_names]
             if invalid:
+                # Plugin toolsets are registered during discovery. Retry validation after
+                # discovery before calling them unknown, matching the TUI startup path.
+                try:
+                    from hermes_cli.plugins import discover_plugins
+
+                    discover_plugins()
+                except Exception:
+                    logger.debug("Plugin discovery failed during toolset validation", exc_info=True)
+                invalid = [t for t in toolsets if not validate_toolset(t) and t not in mcp_names]
+            if invalid:
                 from agent.i18n import t as _t
                 self._console_print(f"[bold red]{_t('cli.startup.unknown_toolsets', names=', '.join(invalid))}[/]")
 

@@ -1,4 +1,7 @@
 """The workspace and admission paths agree on scoped keys and disabled plugins."""
+import pytest
+
+from pm.package import InstallError
 from pm.workspace import enabled_member_dirs
 
 
@@ -68,6 +71,26 @@ def test_pyproject_member_is_renamed_by_its_key_and_stays_unique(tmp_path):
     assert document["project"]["dependencies"] == ["hindsight-client>=0.10.1"]
 
 
+def test_tooling_only_pyproject_becomes_a_valid_virtual_member(tmp_path):
+    import tomllib
+    from pm.workspace import _workspace_member
+
+    plugin = tmp_path / "home" / "plugins" / "tooling-only"
+    plugin.mkdir(parents=True)
+    (plugin / "pyproject.toml").write_text(
+        '[tool.ruff]\ntarget-version = "py311"\n', encoding="utf-8"
+    )
+    root = tmp_path / "generation"
+    root.mkdir()
+
+    member = _workspace_member(plugin, root, identity=plugin)
+    document = tomllib.loads((member / "pyproject.toml").read_text(encoding="utf-8"))
+    assert document["project"]["name"].startswith("hermes-plugin-tooling-only-")
+    assert document["project"]["version"] == "0.0.0"
+    assert document["project"]["requires-python"] == ">=3.11"
+    assert document["tool"]["ruff"]["target-version"] == "py311"
+
+
 def test_buildable_pyproject_member_keeps_its_declared_name(tmp_path):
     """uv verifies a buildable member's [project].name against the package metadata
     its backend produces, so renaming it breaks the build ("Package metadata name
@@ -87,3 +110,54 @@ def test_buildable_pyproject_member_keeps_its_declared_name(tmp_path):
     member = _workspace_member(plugin, root, identity=plugin)
     assert (member / "pyproject.toml").read_text(encoding="utf-8") == (
         plugin / "pyproject.toml").read_text(encoding="utf-8")
+
+
+def test_identical_buildable_members_across_profiles_are_deduplicated(tmp_path):
+    import tomllib
+    from pm.workspace import _generate_pyproject
+
+    source = tmp_path / "core"
+    source.mkdir()
+    (source / "pyproject.toml").write_text(
+        '[project]\nname = "core"\nversion = "1"\n', encoding="utf-8"
+    )
+    plugins = []
+    project = (
+        '[project]\nname = "same_plugin"\nversion = "1"\n'
+        '[build-system]\nrequires = []\nbuild-backend = "backend"\n'
+    )
+    for home in ("a", "b"):
+        plugin = tmp_path / home / "plugins" / "same"
+        plugin.mkdir(parents=True)
+        (plugin / "pyproject.toml").write_text(project, encoding="utf-8")
+        (plugin / "backend.py").write_text("VALUE = 1\n", encoding="utf-8")
+        plugins.append(plugin)
+
+    root = tmp_path / "generation"
+    _generate_pyproject(plugins, root, source=source)
+    document = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    assert len(document["tool"]["uv"]["workspace"]["members"]) == 1
+
+
+def test_divergent_buildable_members_across_profiles_fail_closed(tmp_path):
+    from pm.workspace import _generate_pyproject
+
+    source = tmp_path / "core"
+    source.mkdir()
+    (source / "pyproject.toml").write_text(
+        '[project]\nname = "core"\nversion = "1"\n', encoding="utf-8"
+    )
+    plugins = []
+    for home, value in (("a", 1), ("b", 2)):
+        plugin = tmp_path / home / "plugins" / "same"
+        plugin.mkdir(parents=True)
+        (plugin / "pyproject.toml").write_text(
+            '[project]\nname = "same-plugin"\nversion = "1"\n'
+            '[build-system]\nrequires = []\nbuild-backend = "backend"\n',
+            encoding="utf-8",
+        )
+        (plugin / "backend.py").write_text(f"VALUE = {value}\n", encoding="utf-8")
+        plugins.append(plugin)
+
+    with pytest.raises(InstallError, match="differs across profiles"):
+        _generate_pyproject(plugins, tmp_path / "generation", source=source)
