@@ -1011,6 +1011,25 @@ def _apply_parked_branch_guard(
     """
     if current_branch == branch or current_branch == "HEAD":
         return False, False, None
+    _in_place_configured = False
+    with _best_effort('Could not read updates.parked_branch_strategy: %s'):
+        _in_place_configured = (
+            _updates_config().get("parked_branch_strategy", "switch") == "update_in_place")
+    if _in_place_configured and not switch_branch:
+        # In-place updates preserve the branch by definition, so patch-equivalence is
+        # irrelevant. Avoid `git cherry`: on partial clones it hydrates historical blobs
+        # one at a time and can turn a no-op fetch into a multi-hour operation.
+        status = _git_run(git_cmd, ["status", "--porcelain"], _m().PROJECT_ROOT)
+        if status.returncode == 0 and not status.stdout.strip():
+            if _git_run(
+                git_cmd, ["rev-parse", "--verify", "--quiet", f"origin/{branch}"]
+            ).returncode != 0:
+                print(f"✗ Branch '{branch}' does not exist locally or on origin.")
+                sys.exit(1)
+            print(
+                f"  ℹ On branch '{current_branch}' — updating it in place from "
+                f"origin/{branch} (no branch switch; local commits preserved).")
+            return False, True, "unmerged:unknown"
     switch_safe, switch_block_reason = _m()._assess_parked_branch_switch(
         git_cmd, _m().PROJECT_ROOT, current_branch, branch)
     if not switch_safe:
@@ -1023,10 +1042,6 @@ def _apply_parked_branch_guard(
     if not switch_block_reason.startswith("unmerged:"):
         print(f"  ⚠ Checkout was parked on '{current_branch}' (fully merged) — switching back to {branch}...")
         return True, False, switch_block_reason
-    _in_place_configured = False
-    with _best_effort('Could not read updates.parked_branch_strategy: %s'):
-        _in_place_configured = (
-            _updates_config().get("parked_branch_strategy", "switch") == "update_in_place")
     if not _in_place_configured or switch_branch:
         _m()._print_parked_branch_kept_notice(
             current_branch, branch, switch_block_reason.split(":", 1)[1])
