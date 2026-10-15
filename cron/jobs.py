@@ -609,12 +609,19 @@ def _preserve_file_ownership(path: Path, before: Optional[os.stat_result]) -> No
 
 
 def _is_named_profile_path(path: Path) -> bool:
-    """True if *path* is under ``<hermes_home>/profiles/<name>/`` (default/custom homes are not).
+    """Recognize ``profiles/<name>/{cron,scripts}/...``, not arbitrary ``profiles`` ancestors.
     Checks the resolved path (symlinked parents) and the raw path (symlinked profile homes)."""
+    def matches(candidate: Path) -> bool:
+        parts = candidate.parts
+        return any(
+            part == "profiles" and parts[index + 2] in {"cron", "scripts"}
+            for index, part in enumerate(parts[:-2])
+        )
+
     with contextlib.suppress(OSError, RuntimeError):
-        if "profiles" in path.resolve().parts:
+        if matches(path.resolve()):
             return True
-    return "profiles" in path.parts
+    return matches(path)
 
 
 def _ensure_cron_dir(cron_dir: Path) -> None:
