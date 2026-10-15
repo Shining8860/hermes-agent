@@ -1,7 +1,6 @@
 """Independent core/optional dependency and reviewed CVE policies."""
 import tomllib
 from pathlib import Path
-import re
 
 from packaging.requirements import Requirement
 from packaging.version import Version
@@ -54,25 +53,40 @@ def test_starlette_server_pins_and_lock_exclude_cve_2026_48710():
     assert versions and all(version >= floor for version in versions)
 
 
-def test_exact_pinned_deps_exempt_from_exclude_newer():
-    """An exact pin cannot float, so a release cutoff adds only mirror/install risk."""
+def test_every_dependency_is_held_to_one_three_day_release_age():
+    """Hermes's deps must be >= 3 days old when locked, exact pins included (Teknium ruling).
+
+    A per-package exemption or date would quietly let a fresh release into the lock; the
+    check runs at lock time only, so users never need a mirror that serves upload times.
+    """
+    manifest = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    uv = manifest["tool"]["uv"]
+    lock = tomllib.loads((REPO_ROOT / "uv.lock").read_text(encoding="utf-8"))
+    assert uv["exclude-newer"] == "3 days"
+    assert "exclude-newer-package" not in uv
+    assert lock["options"].get("exclude-newer-span") == "P3D"
+    assert "exclude-newer-package" not in lock["options"]
+
+
+def test_httpx2_pins_and_lock_exclude_ghsa_7mj9_2mp8_4m2p_family():
+    # 2.12.0 is the first httpx2/httpcore2 release clear of GHSA-7mj9-2mp8-4m2p,
+    # GHSA-f2fp-rgf2-35cp, GHSA-h4x7-gw46-3wm6, GHSA-pf96-p4fj-6566 and
+    # GHSA-8xx6-hgc6-gc2m; the boundary is independent of today's exact pin.
+    floor = Version("2.12.0")
     metadata = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    requirements = list(metadata["project"]["dependencies"])
-    for values in metadata["project"]["optional-dependencies"].values():
-        requirements.extend(values)
-    for values in metadata["dependency-groups"].values():
-        requirements.extend(values)
-    requirements.extend(metadata["build-system"]["requires"])
-
-    def normalized(name: str) -> str:
-        return re.sub(r"[-_.]+", "-", name).lower()
-
-    policy = {normalized(name): value for name, value in
-              metadata["tool"]["uv"]["exclude-newer-package"].items()}
-    exact = set()
-    for raw in requirements:
-        requirement = Requirement(raw)
-        specs = list(requirement.specifier)
-        if len(specs) == 1 and specs[0].operator == "==" and "*" not in specs[0].version:
-            exact.add(normalized(requirement.name))
-    assert {name for name in exact if policy.get(name) is not False} == set()
+    lock = tomllib.loads((REPO_ROOT / "uv.lock").read_text(encoding="utf-8"))
+    declared = dict(metadata["project"]["optional-dependencies"])
+    declared["group:dev"] = metadata["dependency-groups"]["dev"]
+    found = set()
+    for where, specs in declared.items():
+        for requirement in map(Requirement, specs):
+            if requirement.name != "httpx2":
+                continue
+            pins = list(requirement.specifier)
+            assert len(pins) == 1 and pins[0].operator == "==", (where, requirement)
+            assert Version(pins[0].version) >= floor, (where, requirement)
+            found.add(where)
+    assert {"mcp", "computer-use", "group:dev"} <= found
+    for name in ("httpx2", "httpcore2"):
+        versions = [Version(row["version"]) for row in lock["package"] if row["name"] == name]
+        assert versions and all(version >= floor for version in versions), (name, versions)
