@@ -192,6 +192,31 @@ cron ticking (`#69377`), `/p/<profile>/` HTTP admission, route eligibility,
 and the runtime status surface. An excluded profile stays installed and can
 still run its own standalone gateway.
 
+## Kanban dispatcher ownership
+
+The embedded dispatcher is a process-global singleton, but its configuration
+belongs to one served profile. At boot, the multiplexer evaluates
+`kanban.dispatch_in_gateway` under every reserved served home's native runtime
+scope. Exactly one enabled profile owns the dispatcher; zero disables it, and
+multiple enabled profiles fail closed with an operator-visible error. The
+setting defaults to `true`, so disable dispatch explicitly in every other
+served profile. An installed but excluded profile is not a candidate. A
+standalone gateway continues to consider only its own launch home.
+
+The owner supplies dispatch limits, the live auto-decompose toggle, emergency
+pause scope, and credentials. Each thread hop first discards request-local
+ContextVars, then explicitly re-enters that owner's home, secret and terminal
+scope. This preserves delegated-child write fences without borrowing the
+launch profile's settings. Ownership is fixed until restart; profile or
+ownership changes require a controlled gateway restart.
+
+The existing machine-global `.dispatcher.lock` still decides physical
+singleton ownership; selecting a profile does not create another daemon or
+move the shared boards. Notifier subscriptions keep their separate stamped
+profile and adapter routing. `HERMES_KANBAN_DISPATCH_IN_GATEWAY=false` remains
+a process-wide veto. The lock is released on shutdown, including cancellation
+during the initial startup delay.
+
 ## Per-profile persistence
 
 `SessionStore` binds no database handle at construction (`#88532`). Session

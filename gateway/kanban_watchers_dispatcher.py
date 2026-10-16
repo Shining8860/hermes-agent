@@ -305,12 +305,12 @@ class _KanbanDispatcher:
 
 @contextlib.contextmanager
 def _default_profile_secret_scope():
-    """Install the gateway launch profile's secret scope while multiplexing is on.
+    """Install the dispatcher's owning home secret scope while multiplexing is on.
 
-    The tick runs via ``_to_thread_process_service`` in a fresh context, so no
-    per-turn scope exists and ``get_secret`` fails closed. The decomposer's aux
-    LLM reads ``auxiliary.*`` from ``get_hermes_home()``, so its credentials come
-    from that same home. No-op for single-profile gateways.
+    The gateway tick explicitly binds its selected owner inside the fresh
+    process-service context. Direct legacy callers without an owner scope use
+    the launch home. The decomposer's auxiliary config and credentials must
+    resolve through that same home. No-op for single-profile gateways.
     """
     from agent.secret_scope import (
         build_profile_secret_scope, is_multiplex_active, reset_secret_scope, set_secret_scope)

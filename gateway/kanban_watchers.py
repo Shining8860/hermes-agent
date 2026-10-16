@@ -213,24 +213,16 @@ class GatewayKanbanWatchersMixin:
         toggle which is re-read every tick. The env var is an escape hatch to
         disable without editing YAML.
         """
-        try:
-            from hermes_cli.config import load_config as _load_config
-        except Exception:
-            logger.warning("kanban dispatcher: config loader unavailable; disabled")
-            return None
         env_override = os.environ.get("HERMES_KANBAN_DISPATCH_IN_GATEWAY", "").strip().lower()
         if env_override in {"0", "false", "no", "off"}:
             logger.info("kanban dispatcher: disabled via HERMES_KANBAN_DISPATCH_IN_GATEWAY env")
             return None
-        try:
-            cfg = _load_config()
-        except Exception as exc:
-            logger.warning("kanban dispatcher: cannot load config (%s); disabled", exc)
+        from gateway.kanban_dispatcher_scope import select_dispatcher_profile
+
+        owner = select_dispatcher_profile(self)
+        if owner is None:
             return None
-        kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
-        if not kanban_cfg.get("dispatch_in_gateway", True):
-            logger.info("kanban dispatcher: disabled via config kanban.dispatch_in_gateway=false")
-            return None
+        kanban_cfg = owner.config.get("kanban", {})
         try:
             from hermes_cli import kanban_db as _kb
         except Exception:
@@ -252,13 +244,15 @@ class GatewayKanbanWatchersMixin:
         else:
             logger.warning("kanban dispatcher: advisory lock unavailable at %s; proceeding "
                            "on config control alone.", _lock_path)
-        return _load_config, _kb, kanban_cfg
+        self._kanban_dispatcher_profile = owner
+        logger.info("kanban dispatcher: owner profile=%s", owner.name)
+        return owner.load_config, _kb, kanban_cfg
 
     async def _kanban_dispatcher_watcher(self) -> None:
         """Embedded kanban dispatcher — one tick every `dispatch_interval_seconds`.
 
-        Gated by `kanban.dispatch_in_gateway` (default True); when false the
-        loop exits and an external `hermes kanban daemon` is expected. Each
+        Exactly one served profile must enable `kanban.dispatch_in_gateway`
+        (default True); standalone gateways consider only their launch home. Each
         tick runs :func:`kanban_db_dispatch.dispatch_once` in a thread; one tick's
         failure never stops the next. Shutdown: ``self._running`` is checked
         between ticks and the in-flight ``to_thread`` returns on its own.
@@ -266,8 +260,14 @@ class GatewayKanbanWatchersMixin:
         boot = self._kanban_dispatcher_boot()
         if boot is None:
             return
-        _load_config, _kb, kanban_cfg = boot
-        settings = _resolve_dispatcher_settings(kanban_cfg, _kb)
+        try:
+            await self._run_kanban_dispatcher(*boot)
+        finally:
+            self._release_kanban_dispatcher_lock()
+
+    async def _run_kanban_dispatcher(self, _load_config, _kb, kanban_cfg) -> None:
+        owner = self._kanban_dispatcher_profile
+        settings = owner.run(_resolve_dispatcher_settings, kanban_cfg, _kb)
         interval = settings.interval
 
         # Initial delay so adapters are wired before workers spawn (matches the notifier).
@@ -287,16 +287,16 @@ class GatewayKanbanWatchersMixin:
                 # Reap zombies before per-board work so a board DB failure
                 # cannot block cleanup of unrelated workers.
                 from hermes_cli import kanban_db_dispatch as _kbd
-                pids = await _to_thread_process_service(_kbd.reap_worker_zombies)
+                pids = await _to_thread_process_service(owner.run, _kbd.reap_worker_zombies)
                 if pids:
                     logger.info("kanban dispatcher: reaped %d zombie worker(s), pids=%s", len(pids), pids)
-            except Exception:
+            except Exception:  # health: allow BLE001 -- process-service boundary logs the traceback via the shared imported logger
                 logger.exception("kanban dispatcher: zombie reaper failed")
 
             try:
                 # Emergency stop (`hermes pause`): no auto-decompose or
                 # dispatch while paused; running workers finish naturally.
-                if not _kanban_dispatch_allowed():
+                if not owner.run(_kanban_dispatch_allowed):
                     bad_ticks = 0
                 else:
                     # Re-read the auto-decompose toggle live so disabling it
@@ -304,10 +304,10 @@ class GatewayKanbanWatchersMixin:
                     _ad_enabled, _ad_per_tick = _resolve_auto_decompose_settings(_load_config)
                     # See #49638.
                     if _ad_enabled:
-                        await _to_thread_process_service(dispatcher.auto_decompose_tick, _ad_per_tick)
-                    results = await _to_thread_process_service(dispatcher.tick_once)
+                        await _to_thread_process_service(owner.run, dispatcher.auto_decompose_tick, _ad_per_tick)
+                    results = await _to_thread_process_service(owner.run, dispatcher.tick_once)
                     any_spawned = _log_spawn_results(results)
-                    ready_pending = await _to_thread_process_service(dispatcher.ready_nonempty)
+                    ready_pending = await _to_thread_process_service(owner.run, dispatcher.ready_nonempty)
                     bad_ticks = bad_ticks + 1 if ready_pending and not any_spawned else 0
                 now = int(time.time())
                 if bad_ticks >= _HEALTH_WINDOW and now - last_warn_at >= 300:
@@ -322,11 +322,8 @@ class GatewayKanbanWatchersMixin:
                     last_warn_at = now
             except asyncio.CancelledError:
                 logger.debug("kanban dispatcher: cancelled")
-                self._release_kanban_dispatcher_lock()
                 raise
-            except Exception:
+            except Exception:  # health: allow BLE001 -- preserve tick supervision and log the traceback via the shared imported logger
                 logger.exception("kanban dispatcher: unexpected watcher error")
 
             await self._sleep_between_ticks(interval)
-
-        self._release_kanban_dispatcher_lock()
