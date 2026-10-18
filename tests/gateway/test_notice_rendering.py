@@ -94,6 +94,7 @@ class TestDeliverNoticeLine:
         source = _make_source()
         adapter = MagicMock()
         adapter.send = AsyncMock(return_value=MagicMock(success=True))
+        adapter._send_with_retry = AsyncMock(return_value=MagicMock(success=True))
         runner = _make_runner_with_adapter(source, adapter)
 
         line = render_notice_line(
@@ -101,10 +102,13 @@ class TestDeliverNoticeLine:
         )
         await runner._deliver_platform_notice(source, line)
 
-        adapter.send.assert_awaited_once()
-        args, _kwargs = adapter.send.call_args
-        assert args[0] == "555"
+        # The notice rides the same retry bracket as a final reply; a bare send() would
+        # lose a ConnectError silently (t_9f5fdb0c).
+        adapter.send.assert_not_awaited()
+        adapter._send_with_retry.assert_awaited_once()
+        kwargs = adapter._send_with_retry.call_args.kwargs
+        assert kwargs["chat_id"] == "555"
         # Delivered verbatim — the policy's single glyph, not a doubled one.
-        assert args[1] == "⚠ Credits 90% used · $20.00 cap"
+        assert kwargs["content"] == "⚠ Credits 90% used · $20.00 cap"
 
 

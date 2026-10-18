@@ -210,7 +210,16 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 result = await adapter.send_private_notice(source.chat_id, source.user_id, content, metadata=metadata)
                 if getattr(result, "success", False):
                     return
-        await adapter.send(source.chat_id, content, metadata=metadata)
+        # A notice rides the same retry bracket as a final reply instead of one bare ``send``: a
+        # ConnectError that clears on the second attempt used to be a silent loss, and a refusal the
+        # bracket cannot fix must at least be visible here (notices have no delivery-ledger row).
+        result = await adapter._send_with_retry(chat_id=source.chat_id, content=content, metadata=metadata)
+        if not getattr(result, "success", False):
+            logger.warning(
+                "[%s] Platform notice was not delivered (retryable=%s, may-already-be-delivered=%s, error=%s)",
+                getattr(adapter, "name", getattr(source, "platform", "?")),
+                getattr(result, "retryable", False), getattr(result, "delivery_uncertain", False),
+                getattr(result, "error", ""))
 
     async def _deliver_media_from_response(
         self, response: str, event: MessageEvent, adapter, thread_metadata: Optional[dict[str, Any]] = None

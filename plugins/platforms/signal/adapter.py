@@ -66,6 +66,44 @@ _SKIP_IMAGE_LOG = {
 _QUOTE_AUTHOR_KEYS = (
     "author", "authorNumber", "authorUuid", "authorAci", "authorServiceId", "authorServiceIdString")
 
+# Attachment sends have no gateway retry bracket (``_send_with_retry`` carries final TEXT only) and no
+# delivery-ledger row, so the adapter owns exactly ONE retry for a request that provably never reached
+# signal-cli. Never a third attempt, and never for an ambiguous timeout (see ``SignalTransportError``).
+SIGNAL_ATTACHMENT_MAX_ATTEMPTS = 2
+SIGNAL_ATTACHMENT_RETRY_DELAY_SECONDS = 2.0
+
+
+class SignalTransportError(Exception):
+    """One JSON-RPC round-trip to signal-cli failed before any answer arrived.
+
+    ``delivery_uncertain`` decides who may retry: ``False`` means the request provably never reached
+    the daemon (``httpx.ConnectError`` / ``httpx.ConnectTimeout``, or no client at all), so a re-send
+    cannot duplicate anything. ``True`` means the request bytes may already have been accepted and only
+    the answer was lost (read/write timeout, connection dropped mid-response): nothing may re-send it
+    inline — only the delivery ledger may redeliver, and it prefixes that redelivery with a visible
+    possible-duplicate marker.
+    """
+
+    def __init__(self, method: str, label: str, *, delivery_uncertain: bool) -> None:
+        super().__init__(f"signal-cli transport error in {method}: {label}")
+        self.method = method
+        self.label = label
+        self.delivery_uncertain = delivery_uncertain
+
+
+def _transport_failure_kind(exc: BaseException) -> Optional[bool]:
+    """Classify an HTTP-client exception as a signal-cli transport failure.
+
+    ``False`` = provably never delivered, ``True`` = ambiguous (may have been delivered already),
+    ``None`` = not a transport failure, so the caller keeps its previous swallow-and-log behaviour.
+    """
+    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+        return False
+    if isinstance(exc, (httpx.TransportError, ConnectionError, TimeoutError)):
+        return True
+    return None
+
+
 
 def _parse_comma_list(value: str) -> list[str]:
     """Split a comma-separated string into a list, stripping whitespace."""
@@ -696,11 +734,16 @@ class SignalAdapter(BasePlatformAdapter):
         return await cache(raw_data, ext), ext
 
     async def _rpc(self, method: str, params: dict, rpc_id: str | None = None, *, log_failures: bool = True,
-                   raise_on_rate_limit: bool = False, timeout: float = 30.0) -> Any:
+                   raise_on_rate_limit: bool = False, raise_on_transport_error: bool = False,
+                   timeout: float = 30.0) -> Any:
         """Send a JSON-RPC 2.0 request to signal-cli. ``log_failures=False`` logs failures at DEBUG (typing
         path: silence NETWORK_FAILURE spam); ``raise_on_rate_limit=True`` raises ``SignalRateLimitError``
-        on a 429 / RateLimitException instead of swallowing it."""
+        on a 429 / RateLimitException instead of swallowing it; ``raise_on_transport_error=True`` raises
+        ``SignalTransportError`` when the HTTP round-trip itself failed, so a send path can build a typed
+        ``SendResult`` instead of the unclassifiable ``None``. Every other failure still returns ``None``."""
         if not self.client:
+            if raise_on_transport_error:
+                raise SignalTransportError(method, "client not connected", delivery_uncertain=False)
             logger.warning("Signal: RPC called but client not connected")
             return None
         payload = {"jsonrpc": "2.0", "method": method, "params": params,
@@ -727,6 +770,9 @@ class SignalAdapter(BasePlatformAdapter):
         except SignalRateLimitError:
             raise
         except Exception as e:
+            uncertain = _transport_failure_kind(e)
+            if uncertain is not None and raise_on_transport_error:
+                raise SignalTransportError(method, type(e).__name__, delivery_uncertain=uncertain) from e
             logger.log(fail_level, "Signal RPC %s failed: %s", method, e)
             return None
 
@@ -792,15 +838,46 @@ class SignalAdapter(BasePlatformAdapter):
             return chunks
         return [(f"{txt} ({idx}/{len(chunks)})", st) for idx, (txt, st) in enumerate(chunks, start=1)]
 
+    @staticmethod
+    def _transport_failure(exc: SignalTransportError, fail_error: str) -> SendResult:
+        """Typed failure for a failed transport round-trip: ``retryable`` for the retry owner,
+        ``error_kind='transient'``, and ``delivery_uncertain`` IFF a re-send could duplicate."""
+        return SendResult(success=False, error=f"{fail_error}: {exc.label}", retryable=True,
+                          delivery_uncertain=exc.delivery_uncertain, error_kind="transient")
+
     async def _rpc_send(self, params: dict[str, Any], fail_error: str) -> tuple[Any, Optional[SendResult]]:
-        """Run a ``send`` RPC, validate and track it; ``(result, None)`` or ``(None, failed SendResult)``."""
-        if (result := await self._rpc("send", params)) is None:
+        """Run a ``send`` RPC, validate and track it; ``(result, None)`` or ``(None, failed SendResult)``.
+
+        A transport failure is surfaced typed (``retryable``, ``delivery_uncertain``) instead of as an
+        unclassifiable ``None``: the retry owner (``_send_with_retry`` / delivery ledger) can then decide
+        between an inline retry, a ledger redelivery, or nothing at all.
+        """
+        try:
+            result = await self._rpc("send", params, raise_on_transport_error=True)
+        except SignalTransportError as e:
+            logger.warning("Signal: send transport failure (%s, may-already-be-delivered=%s)",
+                           e.label, e.delivery_uncertain)
+            return None, self._transport_failure(e, fail_error)
+        if result is None:
             return None, SendResult(success=False, error=fail_error)
         success, err_msg = self._validate_send_result(result)
         if not success:
             return None, SendResult(success=False, error=err_msg, raw_response=result)
         self._track_sent_timestamp(result)
         return result, None
+
+    def _send_retry_is_final(self, result: SendResult) -> bool:
+        """Signal never benefits from the base class's plain-text fallback: formatting is converted
+        locally before the RPC, so a failed ``send`` is a daemon or transport problem, not a markup
+        problem, and the fallback would only resend the same payload truncated to 3,500 characters.
+        So two kinds of failure are final for the retry bracket: an ambiguous transport failure (a
+        re-send could duplicate, only the delivery ledger may redeliver it) and a daemon/RPC rejection
+        (``retryable=False``), which the bracket could not fix anyway. A provably undelivered request
+        (``retryable`` and not ``delivery_uncertain``) is left to the bracket's bounded retry.
+        """
+        if result.success:
+            return False
+        return result.delivery_uncertain or not result.retryable
 
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None,
                    metadata: Optional[dict[str, Any]] = None) -> SendResult:
@@ -821,6 +898,14 @@ class SignalAdapter(BasePlatformAdapter):
                         chat_id)
             last_result, err = await self._rpc_send(params, "RPC send failed")
             if err:
+                if idx > 1:
+                    # Earlier chunks are already on the recipient's device: a whole-payload retry would
+                    # duplicate them (base's ordinary retry re-sends `content`), so mark the partial and
+                    # hand the failure to the retry owner as ambiguous-by-construction.
+                    raw = err.raw_response if isinstance(err.raw_response, dict) else {}
+                    err.raw_response = {**raw, "partial_overflow": True, "chunks_sent": idx - 1,
+                                       "chunks_total": len(chunks)}
+                    err.delivery_uncertain = True
                 return err
         # No editable message identifier; message_id=None keeps the stream consumer on the non-edit path.
         return SendResult(success=True, message_id=None, raw_response=last_result)
@@ -922,13 +1007,16 @@ class SignalAdapter(BasePlatformAdapter):
     async def _send_attachment_batch(self, scheduler, params: dict[str, Any], n: int, label: str) -> bool:
         """Send one attachment batch with rate-limit pacing and a single transient retry. Tokens are
         deducted only on validated success (None = server never accepted it); 429s feed the scheduler.
+        An ambiguous transport failure (read/write timeout) is never retried — the batch may already be
+        on its way, and a second copy of every attachment is worse than a reported loss.
         Returns True when the server accepted the batch."""
         send_timeout, max_attempts = _signal_send_timeout(n), SIGNAL_RATE_LIMIT_MAX_ATTEMPTS
         for attempt in range(1, max_attempts + 1):
             await scheduler.acquire(n)
             t0 = time.monotonic()
             try:
-                result = await self._rpc("send", params, raise_on_rate_limit=True, timeout=send_timeout)
+                result = await self._rpc("send", params, raise_on_rate_limit=True,
+                                         raise_on_transport_error=True, timeout=send_timeout)
             except SignalRateLimitError as e:
                 scheduler.feedback(e.retry_after, n)
                 retry_after = f"{e.retry_after:.0f}s" if e.retry_after else "unknown"
@@ -939,6 +1027,14 @@ class SignalAdapter(BasePlatformAdapter):
                 logger.warning("Signal: rate-limited on batch %s (attempt %d/%d, server retry_after=%s); "
                                "scheduler will pace the retry", label, attempt, max_attempts, retry_after)
                 continue
+            except SignalTransportError as e:
+                if e.delivery_uncertain:
+                    logger.error("Signal: batch %s transport failure (%s) may already have been accepted; "
+                                 "not retried (%d attachments, duplicate risk)", label, e.label, n)
+                    return False
+                logger.warning("Signal: batch %s never reached signal-cli (%s); riding the normal retry",
+                               label, e.label)
+                result = None
             duration = time.monotonic() - t0
             success, err_msg = self._validate_send_result(result) if result is not None else (False, None)
             if success:
@@ -977,11 +1073,28 @@ class SignalAdapter(BasePlatformAdapter):
         return await self._send_file(chat_id, file_path, caption, "RPC send with attachment failed")
 
     async def _send_file(self, chat_id: str, file_path: str, caption: Optional[str], fail_error: str) -> SendResult:
-        """Send one local file as a Signal attachment via the ``send`` RPC."""
+        """Send one local file as a Signal attachment via the ``send`` RPC.
+
+        The adapter is the only retry owner an attachment has (``_send_with_retry`` carries final text
+        and no ledger row exists for media), so it gets exactly one retry — and only for a request that
+        provably never reached signal-cli. An ambiguous transport failure is returned typed and never
+        re-sent: a duplicated voice note or document is worse than a reported loss.
+        """
         params = await self._with_target(
             {"account": self.account, "message": caption or "", "attachments": [file_path]}, chat_id)
-        _, err = await self._rpc_send(params, fail_error)
-        return err or SendResult(success=True)
+        failure: Optional[SendResult] = None
+        for attempt in range(1, SIGNAL_ATTACHMENT_MAX_ATTEMPTS + 1):
+            _, err = await self._rpc_send(params, fail_error)
+            if err is None:
+                return SendResult(success=True)
+            failure = err
+            retryable = err.retryable and not err.delivery_uncertain
+            if not retryable or attempt >= SIGNAL_ATTACHMENT_MAX_ATTEMPTS:
+                return err
+            logger.warning("Signal: attachment send attempt %d/%d never reached signal-cli (%s); "
+                           "retrying with the identical payload", attempt, SIGNAL_ATTACHMENT_MAX_ATTEMPTS, err.error)
+            await asyncio.sleep(SIGNAL_ATTACHMENT_RETRY_DELAY_SECONDS)
+        return failure or SendResult(success=False, error=fail_error)
 
     async def _send_attachment(self, chat_id: str, file_path: str, media_label: str,
                                caption: Optional[str] = None) -> SendResult:

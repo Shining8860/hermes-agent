@@ -1649,6 +1649,12 @@ class SendResult:
     raw_response: Any = None
     retryable: bool = False  # transient connection error — base retries automatically
     retry_after: Optional[float] = None  # server-requested delay (Telegram FloodWait) beats our backoff
+    # The transport failed AFTER the request may already have reached the platform (a read/write
+    # timeout, a connection dropped mid-response). ``retryable`` still tells an owner that a LATER
+    # redelivery is allowed, but no inline retry may run: re-sending could duplicate a payload the
+    # platform already accepted. ``_send_with_retry`` returns it as-is instead of retrying or switching
+    # to plain text; the delivery ledger owns the redelivery and marks it as a possible duplicate.
+    delivery_uncertain: bool = False
     # Extra ids (send order) when a payload was split; ``message_id`` is then the LAST id so
     # later edits target the newest chunk.
     continuation_message_ids: tuple = ()
@@ -3598,7 +3604,16 @@ class BasePlatformAdapter(ABC):
         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Any = None,
         max_retries: int = 2, base_delay: float = 2.0) -> SendResult:
         """Send with exponential-backoff retry on transient network errors; permanent
-        failures fall back to a plain-text send, exhausted retries notify the user."""
+        failures fall back to a plain-text send, exhausted retries notify the user.
+
+        Budget: at most ``1 + max_retries`` send attempts plus one best-effort delivery-failure
+        notice (4 HTTP requests with the default 2 retries) and at most
+        ``base_delay * (2**max_retries - 1) + max_retries`` seconds of backoff sleep (≤ 8 s with the
+        defaults, jitter included) — the loop is finite by construction. A ``delivery_uncertain``
+        failure ends the bracket immediately: the platform may already have the payload, so neither an
+        inline retry nor the plain-text fallback (which resends ``content[:3500]``) may run; the
+        delivery ledger owns that redelivery.
+        """
         async def _send(text: str) -> SendResult:
             return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
 
@@ -3611,7 +3626,7 @@ class BasePlatformAdapter(ABC):
             return await self._resume_partial_send(chat_id, previous, reply_to=reply_to, metadata=metadata)
 
         result = await _send(content)
-        if result.success or self._send_retry_is_final(result):
+        if result.success or result.delivery_uncertain or self._send_retry_is_final(result):
             return result
         error_str = result.error or ""
         # A rate-limited / flood-capped send is transient: it should back off
@@ -3663,7 +3678,7 @@ class BasePlatformAdapter(ABC):
                     logger.info("[%s] Send succeeded on retry %d", self.name, attempt)
                     return result
                 error_str = result.error or ""
-                if self._send_retry_is_final(result):
+                if result.delivery_uncertain or self._send_retry_is_final(result):
                     return result
                 if result.retry_after is not None:
                     server_retry_after = result.retry_after
