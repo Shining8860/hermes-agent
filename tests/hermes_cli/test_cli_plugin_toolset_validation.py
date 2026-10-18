@@ -1,46 +1,31 @@
+"""The gateway owns toolset validation; CLI startup must not load plugins (PLG-7).
+
+The old overlay's discover-before-warning hook is superseded. Gateway-side
+unknown-name refusal is covered by test_cli_profile_toolsets.py.
+"""
 from __future__ import annotations
+
+import pytest
 
 import cli as cli_module
 from hermes_cli import plugins as plugins_module
 
 
-def test_init_toolsets_discovers_plugins_before_warning(monkeypatch):
-    discovered = False
+@pytest.mark.parametrize("name", ["plugin_demo", "definitely_unknown"])
+def test_init_defers_toolset_validation_to_gateway(monkeypatch, name):
     rendered: list[str] = []
 
-    def fake_discover_plugins() -> None:
-        nonlocal discovered
-        discovered = True
+    def no_discovery(*_args, **_kwargs):
+        pytest.fail("CLI toolset initialization must not discover plugins")
 
-    def fake_validate_toolset(name: str) -> bool:
-        return name == "plugin_demo" and discovered
-
-    monkeypatch.setattr(plugins_module, "discover_plugins", fake_discover_plugins)
-    monkeypatch.setattr(cli_module, "validate_toolset", fake_validate_toolset)
+    for entrypoint in ("discover_plugins", "get_plugin_manager", "get_plugin_toolset_keys_nowait"):
+        monkeypatch.setattr(plugins_module, entrypoint, no_discovery)
     monkeypatch.setitem(cli_module.CLI_CONFIG, "agent", {"disabled_toolsets": []})
-    monkeypatch.setitem(cli_module.CLI_CONFIG, "mcp_servers", {})
 
     session = object.__new__(cli_module.HermesCLI)
     session._console_print = rendered.append
+    session._init_toolsets([name])
 
-    session._init_toolsets(["plugin_demo"])
-
-    assert discovered is True
-    assert session.enabled_toolsets == ["plugin_demo"]
+    assert session.enabled_toolsets == [name]
+    assert session._explicit_toolsets is True
     assert rendered == []
-
-
-def test_init_toolsets_still_warns_for_unknown_name_after_discovery(monkeypatch):
-    rendered: list[str] = []
-
-    monkeypatch.setattr(plugins_module, "discover_plugins", lambda: None)
-    monkeypatch.setattr(cli_module, "validate_toolset", lambda _name: False)
-    monkeypatch.setitem(cli_module.CLI_CONFIG, "agent", {"disabled_toolsets": []})
-    monkeypatch.setitem(cli_module.CLI_CONFIG, "mcp_servers", {})
-
-    session = object.__new__(cli_module.HermesCLI)
-    session._console_print = rendered.append
-
-    session._init_toolsets(["definitely_unknown"])
-
-    assert rendered == ["[bold red]Warning: Unknown toolsets: definitely_unknown[/]"]
