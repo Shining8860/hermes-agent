@@ -20,7 +20,10 @@ from pm import paths
 from pm.package import InstallError
 from pm.plugin_declarations import read_python_declaration, manifest_version_error
 
-_MEMBER_EXCLUDE = frozenset({".git", ".venv", "venv", "node_modules", "__pycache__"})
+_MEMBER_EXCLUDE = frozenset({
+    ".git", ".venv", "venv", "node_modules", "__pycache__",
+    ".pytest_cache", ".mypy_cache", ".ruff_cache", ".hypothesis",
+})
 
 
 def _member_ignored(directory, names):
@@ -76,19 +79,25 @@ def _member_content_stamp(entry: Path) -> str:
     return h.hexdigest()
 
 
-def _deduplicate_buildable_members(entries: Mapping[Path, Path]) -> list[tuple[Path, Path]]:
+def _deduplicate_buildable_members(
+    entries: Mapping[Path, Path], *, preferred_members: frozenset[str] = frozenset(),
+) -> list[tuple[Path, Path]]:
     """Collapse byte-identical buildable plugins enabled in several profiles.
 
     uv rejects multiple workspace members with the same project name. Profile-local
     clones of one plugin are valid inputs, but divergent clones are ambiguous and
-    must fail closed instead of selecting one silently.
+    must fail closed instead of selecting one silently. Prefer the seed lock's
+    existing editable member: uv reads its source before updating the lock, so
+    choosing an earlier profile's clone would strand that recorded source path.
     """
     import re
     import tomllib
 
     selected: list[tuple[Path, Path]] = []
     buildable: dict[str, tuple[str, Path]] = {}
-    for identity, source in entries.items():
+    ordered = sorted(entries.items(), key=lambda row:
+                     f"plugin-sources/{_member_key(row[0])}" not in preferred_members)
+    for identity, source in ordered:
         declaration = read_python_declaration(source)
         pyproject = declaration.pyproject
         if pyproject is None:
@@ -162,7 +171,8 @@ def _copy_core_inputs(source: Path, destination: Path) -> None:
         shutil.copy2(entry, target)
 
 
-def _generate_pyproject(plugin_dirs: list[Path] | Mapping[Path, Path], root: Path, *, source: Path) -> None:
+def _generate_pyproject(plugin_dirs: list[Path] | Mapping[Path, Path], root: Path, *,
+                        source: Path, seed_lock: Path | None = None) -> None:
     """Snapshot core and plugin build inputs into a fresh generation."""
     source = source.resolve()
     if root.resolve() == source or source.is_relative_to(root.resolve()):
@@ -172,11 +182,22 @@ def _generate_pyproject(plugin_dirs: list[Path] | Mapping[Path, Path], root: Pat
     core_pyproject = source / "pyproject.toml"
     core_text = core_pyproject.read_text(encoding="utf-8-sig")
 
+    preferred_members = frozenset()
+    if seed_lock is not None:
+        import tomllib
+
+        locked = tomllib.loads(seed_lock.read_text(encoding="utf-8-sig"))
+        preferred_members = frozenset(
+            package["source"]["editable"] for package in locked.get("package", [])
+            if "editable" in package.get("source", {})
+        )
+
     candidates = {identity: plugin_source
                   for identity, plugin_source in member_sources(plugin_dirs).items()
                   if _is_member_candidate(plugin_source)}
     members = [_workspace_member(plugin_source, root, identity=identity).relative_to(root).as_posix()
-               for identity, plugin_source in _deduplicate_buildable_members(candidates)]
+               for identity, plugin_source in _deduplicate_buildable_members(
+                   candidates, preferred_members=preferred_members)]
 
     if members:
         import tomllib
@@ -425,7 +446,7 @@ def lock_and_sync(
     if root.exists() or root.is_symlink():
         raise InstallError("venv", f"workspace must be fresh: {root}")
     if replay is None:
-        _generate_pyproject(plugin_dirs, root, source=source)
+        _generate_pyproject(plugin_dirs, root, source=source, seed_lock=seed_lock)
         if seed_lock is not None:
             (root / "uv.lock").write_bytes(seed_lock.read_bytes())
     else:
