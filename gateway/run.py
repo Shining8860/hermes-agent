@@ -2928,7 +2928,39 @@ def _channel_override_lookup_keys(
     chat_id: str, *, thread_id: Optional[str] = None, parent_id: Optional[str] = None) -> list[str]:
     """Ordered, de-duplicated ``channel_overrides`` lookup keys (matches ``resolve_channel_prompt``:
     exact id first, then parent — Discord threads inherit parent overrides)."""
-    return list(dict.fromkeys(str(key) for key in (chat_id, thread_id, parent_id) if key))
+    from gateway.config import channel_override_lookup_keys
+    return channel_override_lookup_keys(chat_id, thread_id=thread_id, parent_id=parent_id)
+
+
+def _channel_deny_toolsets(
+    config: dict, platform_key: str, source, *, chat_id: Optional[str] = None,
+    chat_type: Optional[str] = None,
+) -> list[str]:
+    """Cumulative toolset deny list for *source* from ``platforms.<platform_key>.channel_overrides``.
+
+    The per-chat half of the deny resolution: every exact key for this chat (id, thread, parent) and the
+    ``group:*`` wildcard contribute, and the caller unions the result with the global
+    ``agent.disabled_toolsets``. Reads the raw config dict (what ``_load_gateway_config`` returns and what
+    every turn already holds) so the values are the ones this turn loaded, not a boot-time snapshot.
+
+    ``source`` may be None for callers that hold only a chat identity (the hosted-room RPC rebuilds a
+    launch policy from config without a ``SessionSource``); those pass ``chat_id`` and ``chat_type``
+    themselves so a room and the turn that reads the same config resolve the same list.
+    """
+    from gateway.config import channel_override_deny_toolsets
+    platforms = config.get("platforms") if isinstance(config, dict) else None
+    section = platforms.get(platform_key) if isinstance(platforms, dict) else None
+    raw = section.get("channel_overrides") if isinstance(section, dict) else None
+    if not isinstance(raw, dict) or not raw:
+        return []
+    return channel_override_deny_toolsets(
+        raw,
+        chat_id=chat_id if chat_id is not None else getattr(source, "chat_id", None),
+        thread_id=getattr(source, "thread_id", None),
+        parent_id=getattr(source, "parent_chat_id", None),
+        chat_type=chat_type if chat_type is not None else getattr(source, "chat_type", None),
+        where=f"platforms.{platform_key}.channel_overrides",
+    )
 
 
 def _get_channel_override(

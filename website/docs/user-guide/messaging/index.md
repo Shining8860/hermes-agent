@@ -338,6 +338,9 @@ platforms:
         system_prompt: "You are the #dev channel code-review specialist."
       "987654321098765432":
         model: openai/gpt-5-mini
+        disabled_toolsets: [browser, text_to_speech]
+      "group:*":                    # every group chat on this platform, never a DM
+        disabled_toolsets: [terminal, file]
 ```
 
 Details:
@@ -346,6 +349,9 @@ Details:
 - Lookup order is exact channel/thread id first, then the **parent** channel/forum id — so Discord threads inherit their parent channel's override automatically.
 - Resolution priority for the model is: session `/model` override → `channel_overrides` → global config. A user running `/model` in a chat still wins over the channel default.
 - The `system_prompt` override replaces the global gateway prompt for that channel (it is ephemeral — injected per turn, not stored in history).
+- `disabled_toolsets` removes toolsets for that chat only. Matching keys **accumulate** (an exact chat id, its thread id and its parent id all contribute) and the `group:*` wildcard adds a deny for group chats while leaving DMs untouched. The global `agent.disabled_toolsets` keeps applying on top.
+- The deny list is resolved per turn and frozen into the session's agent: an edit takes effect on the next turn, never mid-turn. A name that matches no toolset is logged at `ERROR` and never grants anything.
+- Every key is validated. An unknown key (for example `disable_toolsets`, `toolsets`, `system_prompts`) is reported at `WARNING` and ignored instead of silently doing nothing; the same holds for a non-mapping entry.
 
 ## Security
 

@@ -473,11 +473,35 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
         return sorted(_get_platform_tools(user_config, platform_key))
 
     def _resolve_turn_toolsets(self, user_config: dict, source: SessionSource, platform_key: str):
-        """``(enabled_toolsets, disabled_toolsets)`` for an agent run on ``source``."""
+        """``(enabled_toolsets, disabled_toolsets)`` for an agent run on ``source``.
+
+        The ONE seam for toolset selection: the interactive turn (``_run_agent_display_settings``) and
+        the background task (``_run_background_task_inner``) both call this, so a chat's
+        ``platforms.<platform>.channel_overrides[<id>].disabled_toolsets`` — exact keys for chat, thread
+        and parent, plus the ``group:*`` wildcard — and the global ``agent.disabled_toolsets`` produce the
+        SAME set on both paths. ``_get_platform_tools`` already subtracts the global list; the per-chat
+        list is subtracted here so a denial names the same toolsets everywhere (a composite like
+        ``debugging`` removes terminal/web/file, not just its own name).
+
+        Resolved per turn and handed to the agent at construction (and into the agent-cache signature via
+        ``enabled_toolsets``), so a config edit lands on the NEXT turn: the running turn's tool schemas
+        never change under a live prompt cache.
+        """
         from agent.skill_utils import parse_config_string_list
+        from gateway.config import merge_deny_toolsets
+        from gateway.run import _channel_deny_toolsets
         enabled = self._resolve_enabled_toolsets_for_source(user_config, source, platform_key)
-        disabled = parse_config_string_list((user_config.get("agent") or {}).get("disabled_toolsets")) or None
-        return enabled, disabled
+        global_deny = parse_config_string_list((user_config.get("agent") or {}).get("disabled_toolsets"))
+        channel_deny = _channel_deny_toolsets(user_config, platform_key, source)
+        disabled = merge_deny_toolsets(
+            global_deny, channel_deny,
+            where=f"platforms.{platform_key}.channel_overrides[{getattr(source, 'chat_id', '')}].disabled_toolsets",
+        )
+        if channel_deny:
+            # Only the per-chat list needs pruning here: _get_platform_tools already applied the global one.
+            from hermes_cli.tools_config import _prune_toolsets_stripped_by_disabled
+            enabled = sorted(_prune_toolsets_stripped_by_disabled(set(enabled), disabled))
+        return enabled, disabled or None
 
     async def _run_background_task_inner(
         self, prompt: str, source: SessionSource, task_id: str,

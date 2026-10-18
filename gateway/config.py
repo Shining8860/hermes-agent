@@ -8,7 +8,7 @@ import math
 import os
 import re
 from pathlib import Path
-from dataclasses import asdict, dataclass, field, fields, is_dataclass
+from dataclasses import asdict, dataclass, field, is_dataclass
 from typing import Dict, List, Optional, Any, Callable
 from enum import Enum
 
@@ -375,19 +375,171 @@ def persist_home_channel(home: HomeChannel, *, enabled_if_new: bool = False) -> 
     save_config(config)
 
 
+# Every key ``ChannelOverride`` understands. Anything else in a ``channel_overrides`` entry is reported
+# at WARNING (once per entry) instead of being dropped in silence: an operator who writes a plausible
+# but unknown key (``disable_toolsets``, ``toolsets``, ``system_prompts``) previously got no effect and
+# no signal at all — the restriction they configured simply never applied.
+CHANNEL_OVERRIDE_KEYS = frozenset({"model", "provider", "system_prompt", "disabled_toolsets"})
+# Wildcard key in ``channel_overrides``: its deny list applies to every GROUP chat of the platform.
+# DMs are matched by exact id only — a wildcard must never restrict (or be read as applying to) a
+# private chat, and ``chat_type`` is the adapter's own statement of which one this is.
+GROUP_OVERRIDE_WILDCARD = "group:*"
+_GROUP_CHAT_TYPES = frozenset({"group", "channel", "thread"})
+# Dedupe: these fire on every config parse (each turn re-reads the effective config); the operator needs
+# the line once, not once per message.
+_WARNED_CHANNEL_OVERRIDES: set[tuple[str, str]] = set()
+
+
+def _warn_override_once(
+    bucket_key: tuple[str, str], message: str, *args: Any, level: int = logging.WARNING,
+) -> None:
+    if bucket_key in _WARNED_CHANNEL_OVERRIDES:
+        return
+    _WARNED_CHANNEL_OVERRIDES.add(bucket_key)
+    logger.log(level, message, *args)
+
+
+def _normalise_deny_toolsets(value: Any) -> list[str]:
+    """Toolset deny list from a config value.
+
+    Accepts a YAML list, a JSON/Python-literal array string (what ``hermes config set`` writes), a
+    single name, or ``None``. Order is preserved and duplicates are dropped; ``"all"``/``"*"`` survive
+    as-is because they are legitimate deny-everything entries.
+    """
+    from agent.skill_utils import parse_config_string_list
+    names = [str(name).strip() for name in parse_config_string_list(value)]
+    return list(dict.fromkeys(name for name in names if name))
+
+
+def _is_group_chat_type(chat_type: Any) -> bool:
+    """Whether ``chat_type`` is a group-ish surface the ``group:*`` wildcard may apply to."""
+    return str(chat_type or "").strip().lower() in _GROUP_CHAT_TYPES
+
+
+def channel_override_lookup_keys(
+    chat_id: Any, *, thread_id: Any = None, parent_id: Any = None) -> list[str]:
+    """Ordered, de-duplicated exact ``channel_overrides`` keys for one chat (first match wins for
+    ``model``/``provider``/``system_prompt``; deny lists accumulate over all of them)."""
+    return list(dict.fromkeys(str(key) for key in (chat_id, thread_id, parent_id) if key))
+
+
+def channel_override_deny_toolsets(
+    raw_overrides: Any, *, chat_id: Any = None, thread_id: Any = None, parent_id: Any = None,
+    chat_type: Any = None, where: str = "channel_overrides",
+) -> list[str]:
+    """CUMULATIVE ``disabled_toolsets`` from every override matching this chat.
+
+    Matching is ``chat_id``/``thread_id``/``parent_id`` (exact, all of them) plus ``group:*`` when the
+    chat is a group-ish surface. Unlike the single-winner model/provider/prompt lookup, a deny list is
+    a restriction: narrowing it to the first matching key would silently re-enable whatever a second
+    matching key denied.
+    """
+    if not isinstance(raw_overrides, dict) or not raw_overrides:
+        return []
+    exact = set(channel_override_lookup_keys(chat_id, thread_id=thread_id, parent_id=parent_id))
+    in_group = _is_group_chat_type(chat_type)
+    deny: list[str] = []
+    for raw_key, raw_override in raw_overrides.items():
+        key = str(raw_key)
+        if "*" in key:
+            if key != GROUP_OVERRIDE_WILDCARD:
+                _warn_override_once(
+                    (where, key),
+                    "%s[%s]: unsupported channel wildcard ignored; only %r is defined",
+                    where, key, GROUP_OVERRIDE_WILDCARD)
+                continue
+            if not in_group:
+                continue
+        elif key not in exact:
+            continue
+        if not isinstance(raw_override, dict):
+            _warn_override_once(
+                (where, key),
+                "%s[%s]: override must be a mapping, got %s — ignored",
+                where, key, type(raw_override).__name__)
+            continue
+        override = ChannelOverride.from_dict(raw_override, where=f"{where}[{key}]")
+        if key == GROUP_OVERRIDE_WILDCARD and (
+                override.model or override.provider or override.system_prompt):
+            # The model/provider/prompt lookup walks exact chat ids only; a wildcard there would be
+            # another config line that reads as if it applied and never does.
+            _warn_override_once(
+                (where, f"non-deny:{key}"),
+                "%s[%s]: only disabled_toolsets applies to the group wildcard; model/provider/"
+                "system_prompt need an exact chat id — ignored", where, key)
+        deny.extend(override.disabled_toolsets)
+    return list(dict.fromkeys(deny))
+
+
+def merge_deny_toolsets(
+    global_names: Any, channel_names: Any, *, where: str = "agent.disabled_toolsets",
+) -> list[str]:
+    """Union of the global and per-channel deny lists, validated.
+
+    A name that resolves to no toolset is reported at ERROR (once per name) rather than dropped in
+    silence: the operator asked for a restriction the runtime cannot honour, and that is exactly the
+    silent no-op this path exists to end. Fail-closed is preserved in the only direction a deny list
+    can fail: an unresolvable name is never read as permission, and every *resolvable* restriction in
+    the same list still applies (it is not discarded because a sibling entry is a typo).
+
+    The two lists are validated against their own config location, so a typo in the global list is
+    reported once per process instead of once per chat that happens to resolve it.
+    """
+    from toolsets import validate_toolset
+    from model_tools import _LEGACY_TOOLSET_MAP
+
+    global_list = _normalise_deny_toolsets(global_names)
+    channel_list = _normalise_deny_toolsets(channel_names)
+    merged = list(dict.fromkeys([*global_list, *channel_list]))
+    for names, source in ((global_list, "agent.disabled_toolsets"), (channel_list, where)):
+        for name in names:
+            if not validate_toolset(name) and name not in _LEGACY_TOOLSET_MAP:
+                _warn_override_once(
+                    (source, name),
+                    "%s: unknown toolset %r has no tools to disable — the restriction it names never "
+                    "applies. Known names: `hermes tools`; this entry is reported once per process.",
+                    source, name, level=logging.ERROR)
+    return merged
+
+
 @dataclass
 class ChannelOverride:
-    """Per-channel model/provider/system_prompt override (``platforms.<name>.channel_overrides[channel_id]``)."""
+    """Per-channel override (``platforms.<name>.channel_overrides[channel_id]``).
+
+    ``model``/``provider``/``system_prompt`` follow first-match precedence (``_get_channel_override``);
+    ``disabled_toolsets`` is CUMULATIVE over every matching key and the ``group:*`` wildcard — see
+    :func:`channel_override_deny_toolsets`.
+    """
     model: Optional[str] = None
     provider: Optional[str] = None
     system_prompt: Optional[str] = None
+    disabled_toolsets: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
-        return {k: v for k, v in asdict(self).items() if v is not None}
+        # Round-trip: an empty deny list is omitted (it restricts nothing), never emitted as ``[]``,
+        # so ``from_dict(to_dict(x)) == x`` and a persisted override stays as small as it reads.
+        data = {k: v for k, v in asdict(self).items() if v is not None}
+        if not data.get("disabled_toolsets"):
+            data.pop("disabled_toolsets", None)
+        return data
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "ChannelOverride":
-        return cls(**{f.name: data.get(f.name) for f in fields(cls)}) if data else cls()
+    def from_dict(cls, data: dict[str, Any], *, where: str = "channel_overrides") -> "ChannelOverride":
+        if not isinstance(data, dict) or not data:
+            return cls()
+        unknown = [str(key) for key in data if key not in CHANNEL_OVERRIDE_KEYS]
+        if unknown:
+            _warn_override_once(
+                (where, ",".join(sorted(unknown))),
+                "%s: unknown key(s) %s ignored — configure nothing for them; known keys are %s",
+                where, ", ".join(repr(key) for key in sorted(unknown)),
+                ", ".join(sorted(CHANNEL_OVERRIDE_KEYS)))
+        return cls(
+            model=data.get("model"),
+            provider=data.get("provider"),
+            system_prompt=data.get("system_prompt"),
+            disabled_toolsets=_normalise_deny_toolsets(data.get("disabled_toolsets")),
+        )
 
 
 # Platforms whose primary credential is ``PlatformConfig.token`` → its env var (empty-token
@@ -457,10 +609,24 @@ class PlatformConfig:
 
         raw_overrides = data.get("channel_overrides") or {}
         channel_overrides = {
-            str(cid): ChannelOverride.from_dict(ov_data)
+            str(cid): ChannelOverride.from_dict(ov_data, where=f"channel_overrides[{cid}]")
             for cid, ov_data in raw_overrides.items()
             if isinstance(ov_data, dict)
         } if isinstance(raw_overrides, dict) else {}
+        if isinstance(raw_overrides, dict):
+            # A non-mapping override is the same class of silent no-op as an unknown key: report it
+            # here, the single place every config load passes through, instead of dropping it alone.
+            for cid, ov_data in raw_overrides.items():
+                if not isinstance(ov_data, dict):
+                    _warn_override_once(
+                        ("channel_overrides", f"not-a-mapping:{cid}"),
+                        "channel_overrides[%s]: override must be a mapping, got %s — ignored",
+                        cid, type(ov_data).__name__)
+        elif raw_overrides:
+            _warn_override_once(
+                ("channel_overrides", "not-a-mapping"),
+                "channel_overrides must be a mapping of channel id to override, got %s — ignored",
+                type(raw_overrides).__name__)
 
         return cls(
             enabled=_coerce_bool(data.get("enabled"), False),

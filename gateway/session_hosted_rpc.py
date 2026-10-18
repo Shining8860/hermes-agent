@@ -78,7 +78,7 @@ class HostedRoomAuthorityRPC:
     async def _create(self, params):
         if self.authority.db.get_session(self.ref.session_id) is not None:
             return await self._resume(params)
-        from gateway.run import _load_gateway_config, _resolve_gateway_model
+        from gateway.run import _channel_deny_toolsets, _load_gateway_config, _resolve_gateway_model
         from gateway.session_policy import build_policy
         from gateway.session_local import stage_local_session
         from gateway.session_local_recovery import restore_local_session
@@ -91,12 +91,21 @@ class HostedRoomAuthorityRPC:
         # turn that called clarify would block for clarify_timeout with its question unseen. As
         # for cron, freeze it out; the member asks its question in the room reply instead.
         agent = dict(config.get('agent') or {})
+        # A room is a group surface with a stable id, so an operator's
+        # ``platforms.bot_room.channel_overrides[<room_id>].disabled_toolsets`` (and ``group:*``)
+        # reaches it through the same resolver the messaging turns use — not a second deny path.
+        room_deny = set(_channel_deny_toolsets(
+            config, 'bot_room', None, chat_id=self.room_id, chat_type='group'))
         agent['disabled_toolsets'] = sorted(
-            set(parse_config_string_list(agent.get('disabled_toolsets'))) | {'clarify'})
+            set(parse_config_string_list(agent.get('disabled_toolsets'))) | {'clarify'} | room_deny)
         policy = build_policy({'source': 'gui'}, {**config, 'agent': agent}, private_secrets=private)
+        toolsets = set(policy.toolsets) | {'bot_room'}
+        if room_deny:
+            from hermes_cli.tools_config import _prune_toolsets_stripped_by_disabled
+            toolsets = _prune_toolsets_stripped_by_disabled(toolsets, sorted(room_deny))
         policy = replace(policy, source='bot_room', platform='bot_room',
                          model=policy.model or _resolve_gateway_model(policy.config()),
-                         toolsets=tuple(sorted(set(policy.toolsets) | {'bot_room'})))
+                         toolsets=tuple(sorted(toolsets)))
         staged = stage_local_session(self.authority, self.principal, {'request_id': self.creation_id},
                                      trusted_policy=policy, trusted_secrets=private)
         # Creation commit and label run off the owner loop (N90); a concurrent duplicate converges.
