@@ -379,5 +379,196 @@ caption
 
 
 
+class TestBridgeDispatchedProducer:
+    """Deferred/plugin tools are invoked through the generic ``tool_call`` bridge.
+
+    The assistant tool-call row then only knows the bridge name, while the tool-result row
+    keeps the real producer (``agent.tool_dispatch_helpers.make_tool_result_message`` sets
+    ``name`` and ``tool_name``). MEDIA auto-append must judge the real producer, or a
+    narrowly allowlisted plugin producer is silently dropped whenever the model omits the
+    directive from its final reply.
+    """
+
+    GIF_PATH = "/tmp/giphy/turtle.gif"
+
+    @staticmethod
+    def _giphy_result(path: str) -> str:
+        return json.dumps(
+            {
+                "ok": True,
+                "media_path": path,
+                "media_directive": f"MEDIA:{path}",
+                "delivery_instruction": "Copy media_directive exactly into the final response.",
+            }
+        )
+
+    def _messages(self, producer: str, path: str, *, row_name: bool = True):
+        result_row = {
+            "role": "tool",
+            "tool_call_id": "call_bridge",
+            "content": self._giphy_result(path),
+        }
+        if row_name:
+            result_row["name"] = producer
+            result_row["tool_name"] = producer
+        return [
+            {"role": "user", "content": "Send a turtle GIF"},
+            {
+                "role": "assistant",
+                "tool_calls": [{"id": "call_bridge", "function": {"name": "tool_call"}}],
+            },
+            result_row,
+            {"role": "assistant", "content": "Here it is."},
+        ]
+
+    def test_bridge_call_appends_exactly_one_media_tag(self):
+        from gateway.run_turn_runner import TurnRunner
+
+        messages = self._messages("giphy_gif_search", self.GIF_PATH)
+        runner = object.__new__(TurnRunner)  # _append_auto_media_tags touches no instance state
+
+        rendered = runner._append_auto_media_tags(
+            "Here it is.", {"messages": messages}, [], set()
+        )
+
+        assert rendered.count("MEDIA:") == 1, rendered
+        assert f"MEDIA:{self.GIF_PATH}" in rendered
+
+    def test_bridge_producer_does_not_duplicate_model_echo(self):
+        """The model following its prompt ("copy media_directive verbatim") must not yield a
+        second copy of the same attachment from auto-append."""
+        from gateway.run_turn_runner import TurnRunner
+
+        messages = self._messages("giphy_gif_search", self.GIF_PATH)
+        runner = object.__new__(TurnRunner)
+
+        echoed = runner._append_auto_media_tags(
+            f"Here it is.\nMEDIA:{self.GIF_PATH}", {"messages": messages}, [], set()
+        )
+
+        assert echoed.count("MEDIA:") == 1, echoed
+        assert echoed == f"Here it is.\nMEDIA:{self.GIF_PATH}"
+
+    def test_direct_producer_call_still_resolves_from_call_row(self):
+        """A direct call carries no name on the result row; the call-id map still resolves it."""
+        from gateway.run import _collect_auto_append_media_tags
+
+        messages = self._messages("giphy_gif_search", self.GIF_PATH, row_name=False)
+        messages[1]["tool_calls"][0]["function"]["name"] = "giphy_gif_search"
+
+        tags, voice = _collect_auto_append_media_tags(messages, history_offset=0)
+
+        assert tags == [f"MEDIA:{self.GIF_PATH}"]
+        assert voice is False
+
+    def test_bridge_dispatched_non_producer_is_dropped(self):
+        """The allowlist stays a documented producer list: documentation examples from any
+        other bridge-dispatched tool are never auto-attached."""
+        from gateway.run import _collect_auto_append_media_tags
+
+        messages = self._messages("tenor_gif_search", "/tmp/giphy/example_only.gif")
+
+        tags, voice = _collect_auto_append_media_tags(messages, history_offset=0)
+
+        assert tags == []
+        assert voice is False
+
+    def test_bridge_producer_is_deduped_against_history(self):
+        """A bridge-produced path already delivered in a prior turn must not be re-sent."""
+        from gateway.run import _collect_auto_append_media_tags
+
+        messages = self._messages("giphy_gif_search", self.GIF_PATH)
+
+        tags, _voice = _collect_auto_append_media_tags(
+            messages, history_offset=0, history_media_paths={self.GIF_PATH}
+        )
+
+        assert tags == []
+
+    def test_core_producer_through_bridge_also_resolves(self):
+        """The seam is producer-neutral: a core allowlisted producer bridged as ``tool_call``
+        behaves like a direct call. Without the plugin no giphy row exists, so the only new
+        allowlist member is unreachable — the lookup fix is what changes here, not the set."""
+        from gateway.run import _collect_auto_append_media_tags
+
+        row = {
+            "role": "tool",
+            "tool_call_id": "call_bridge",
+            "name": "text_to_speech",
+            "tool_name": "text_to_speech",
+            "content": "MEDIA:/tmp/tts/hello.ogg\n[[audio_as_voice]]",
+        }
+        messages = [
+            {"role": "user", "content": "say hello"},
+            {"role": "assistant", "tool_calls": [{"id": "call_bridge", "function": {"name": "tool_call"}}]},
+            row,
+        ]
+
+        tags, voice = _collect_auto_append_media_tags(messages, history_offset=0)
+
+        assert tags == ["MEDIA:/tmp/tts/hello.ogg"]
+        assert voice is True
+
+    def test_connector_and_delegation_results_never_append(self):
+        """Connector batches and delegated subagent results may echo MEDIA: text; they are not
+        producers, so they never append and can never duplicate the real producer's tag."""
+        from gateway.run import _collect_auto_append_media_tags
+
+        echo = json.dumps({"ok": True, "note": "attachment was MEDIA:/tmp/giphy/turtle.gif"})
+        messages = [
+            {"role": "user", "content": "Send a turtle GIF"},
+            {"role": "tool", "tool_call_id": "c1", "name": "connector__gmail__send_email",
+             "tool_name": "connector__gmail__send_email", "content": echo},
+            {"role": "tool", "tool_call_id": "c2", "name": "delegate_task",
+             "tool_name": "delegate_task", "content": echo},
+        ]
+
+        tags, voice = _collect_auto_append_media_tags(messages, history_offset=0)
+
+        assert tags == []
+        assert voice is False
+
+    def test_producer_allowlist_is_the_documented_closed_set(self):
+        """No pattern, no prefix rule: a producer is eligible only when named here."""
+        from gateway.run import _AUTO_APPEND_MEDIA_TOOL_NAMES
+
+        assert _AUTO_APPEND_MEDIA_TOOL_NAMES == {
+            "text_to_speech",
+            "text_to_speech_tool",
+            "image_generate",
+            "giphy_gif_search",
+        }
+
+
+class TestEffectiveToolName:
+    """The shared producer seam used by MEDIA auto-append, history dedup and path repair."""
+
+    def test_prefers_result_row_name_over_bridge_call_name(self):
+        from gateway.media_repair import effective_tool_name
+
+        msg = {
+            "role": "tool",
+            "tool_call_id": "call_bridge",
+            "name": "tool_call",
+            "tool_name": "giphy_gif_search",
+            "content": "{}",
+        }
+
+        assert effective_tool_name(msg, {"call_bridge": "tool_call"}) == "giphy_gif_search"
+
+    def test_falls_back_to_call_id_map(self):
+        from gateway.media_repair import effective_tool_name
+
+        msg = {"role": "tool", "tool_call_id": "call_tts", "content": "{}"}
+
+        assert effective_tool_name(msg, {"call_tts": "text_to_speech"}) == "text_to_speech"
+
+    def test_unknown_row_and_unknown_call_id_yield_empty(self):
+        from gateway.media_repair import effective_tool_name
+
+        assert effective_tool_name({"role": "tool", "content": "{}"}, {"other": "x"}) == ""
+        assert effective_tool_name({"role": "tool", "content": "{}"}, None) == ""
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

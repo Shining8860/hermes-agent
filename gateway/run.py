@@ -1395,8 +1395,17 @@ def _last_transcript_timestamp(history: Optional[list[dict[str, Any]]]) -> Any:
     return None
 
 
-# Tool output may hold literal MEDIA: examples (docs, logs); only deliberate media producers may auto-append.
-_AUTO_APPEND_MEDIA_TOOL_NAMES = {"text_to_speech", "text_to_speech_tool", "image_generate"}
+# Tool output may hold literal MEDIA: examples (docs, logs, search results); only deliberate
+# media producers may auto-append.  Documented allowlist, never a pattern: a plugin producer
+# must be named here explicitly.  ``giphy_gif_search`` (profile plugin ``giphy-gif``) returns a
+# host-side ``media_directive`` path; it arrives through the ``tool_call`` bridge, which is why
+# the producer lookup below prefers the result row's own name over the bridge name.
+_AUTO_APPEND_MEDIA_TOOL_NAMES = {
+    "text_to_speech",
+    "text_to_speech_tool",
+    "image_generate",
+    "giphy_gif_search",
+}
 
 # Replay-history canonicalization lives in agent/replay_cleanup.py so every resume
 # surface and the send path share one implementation.
@@ -1439,7 +1448,10 @@ _TOOL_MEDIA_RE = re.compile(
 
 
 # Shared with cron delivery and gateway background tasks; canonical names live in gateway.media_repair.
-from gateway.media_repair import tool_name_by_call_id as _tool_name_by_call_id
+from gateway.media_repair import (
+    effective_tool_name as _effective_tool_name,
+    tool_name_by_call_id as _tool_name_by_call_id,
+)
 
 
 def _collect_auto_append_media_tags(
@@ -1470,11 +1482,12 @@ def _collect_auto_append_media_tags(
     for msg in new_messages:
         if msg.get("role") not in ("tool", "function"):
             continue
-        call_id = str(msg.get("tool_call_id") or msg.get("call_id") or "")
-        if tool_name_by_call_id.get(call_id) not in _AUTO_APPEND_MEDIA_TOOL_NAMES:
+        # Bridge-dispatched plugin tools (``tool_call``) carry the real producer on the result
+        # row; resolve it through the shared seam so the allowlist judges the actual tool.
+        tool_name = _effective_tool_name(msg, tool_name_by_call_id)
+        if tool_name not in _AUTO_APPEND_MEDIA_TOOL_NAMES:
             continue
         content = str(msg.get("content") or "")
-        tool_name = tool_name_by_call_id.get(call_id)
         # image_generate emits a JSON path field, not a MEDIA: tag; extract it: deterministic delivery.
         if tool_name == "image_generate" and "MEDIA:" not in content:
             try:
@@ -1530,8 +1543,7 @@ def _collect_history_media_paths(agent_history: list[dict[str, Any]]) -> set:
             continue
         if role == "assistant":
             continue
-        cid = str(msg.get("tool_call_id") or msg.get("call_id") or "")
-        if tool_name_by_call_id.get(cid) == "image_generate":
+        if _effective_tool_name(msg, tool_name_by_call_id) == "image_generate":
             try:
                 payload = json.loads(content)
             except Exception:

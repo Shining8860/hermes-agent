@@ -45,6 +45,29 @@ def tool_name_by_call_id(messages: list[dict[str, Any]]) -> dict[str, str]:
     return mapping
 
 
+def effective_tool_name(msg: dict[str, Any], call_id_names: dict[str, str] | None = None) -> str:
+    """Effective producer name of one tool-result row.
+
+    Deferred/plugin tools are dispatched through the generic ``tool_call`` bridge, so the
+    assistant tool-call row only knows the bridge name while the result row keeps the real
+    producer (``agent.tool_dispatch_helpers.make_tool_result_message`` sets both ``name`` and
+    ``tool_name``).  Prefer the row's own name — it is written by the dispatch layer, not by
+    model output — and fall back to the assistant call-id map for rows that carry neither
+    (older transcripts, hand-built fixtures).
+
+    Single seam for every producer decision (MEDIA auto-append allowlist, image_generate
+    history dedup, computer_use path repair) so a new producer never has to be re-plumbed
+    at each call site.
+    """
+    own_name = str(msg.get("tool_name") or msg.get("name") or "")
+    if own_name:
+        return own_name
+    call_id = str(msg.get("tool_call_id") or msg.get("call_id") or "")
+    if not call_id or not call_id_names:
+        return ""
+    return str(call_id_names.get(call_id) or "")
+
+
 def _computer_use_capture_basename(path: Any) -> str:
     """Canonical (lowercased) capture basename for either separator style, or ''."""
     basename = re.split(r"[/\\]", str(path or "").strip().strip("`\"'"))[-1]
@@ -115,8 +138,7 @@ def _canonical_capture_paths(turn_messages: list[dict[str, Any]]) -> dict[str, s
     for msg in turn_messages:
         if msg.get("role") not in {"tool", "function"}:
             continue
-        call_id = str(msg.get("tool_call_id") or msg.get("call_id") or "")
-        if str(msg.get("name") or msg.get("tool_name") or call_id_names.get(call_id) or "") != "computer_use":
+        if effective_tool_name(msg, call_id_names) != "computer_use":
             continue
         for path in _iter_computer_use_capture_paths(msg.get("content")):
             basename = _computer_use_capture_basename(path)
