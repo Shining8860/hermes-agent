@@ -1379,7 +1379,7 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
             _ra().logger.warning("Memory provider plugin init failed: %s", _mpe)
             agent._memory_manager = None
 
-    from agent.memory_manager import inject_memory_provider_tools
+    from agent.memory_manager_tools import inject_memory_provider_tools
     inject_memory_provider_tools(agent)
 
 

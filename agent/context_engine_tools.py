@@ -6,7 +6,7 @@ registry just to make them searchable. Assemble and query the same scoped catalo
 
 import logging
 
-from agent.memory_manager import normalize_tool_schema
+from agent.memory_manager_tools import normalize_tool_schema
 
 logger = logging.getLogger(__name__)
 
