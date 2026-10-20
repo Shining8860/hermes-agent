@@ -108,8 +108,8 @@ def test_bound_launch_key_wins_over_the_route_key(tmp_path, monkeypatch):
 
 
 def test_primary_auth_failure_never_borrows_a_fallback_providers_key(tmp_path, monkeypatch):
-    """A fallback entry's credential belongs to another provider; the worker's primary route never
-    carries it (the agent's own fallback chain switches provider, model and key together)."""
+    """A fallback entry's credential belongs to another provider: adopt its complete route,
+    never just its key on the primary endpoint."""
     calls = []
 
     def resolve(config, **kwargs):
@@ -118,7 +118,8 @@ def test_primary_auth_failure_never_borrows_a_fallback_providers_key(tmp_path, m
     monkeypatch.setattr('hermes_cli.runtime_provider.resolve_runtime_with_fallback', resolve)
     monkeypatch.setattr('hermes_cli.runtime_provider_custom._resolve_named_custom_runtime', lambda **kw: None)
     built = _execute(_minimax_frame(tmp_path, monkeypatch), monkeypatch)
-    assert calls and built['api_key'] is None
+    assert calls and built['api_key'] == 'fake-other-provider'
+    assert built['provider'] == 'openrouter' and built['model'] == 'x'
 
 
 def _kanban_failures():
@@ -179,12 +180,12 @@ def _primary_auth_failure(monkeypatch, fallback_ok):
 
 def test_primary_auth_failure_reaches_the_turns_refreshed_fallback_chain(tmp_path, monkeypatch):
     """An expired primary with a fallback the user added after session creation: the worker resolves
-    against the chain supplied for this turn, so the agent is built (key-less, its own chain switches
-    provider, model and key together) instead of a start failure."""
+    against the chain supplied for this turn and adopts that route instead of a start failure."""
     calls = _primary_auth_failure(monkeypatch, fallback_ok=True)
     built = _execute(_with_turn_chain(_minimax_frame(tmp_path, monkeypatch), [FALLBACK]), monkeypatch)
     assert FALLBACK['provider'] in calls
-    assert built['fallback_model'] == [FALLBACK] and built['api_key'] is None
+    assert built['fallback_model'] == [FALLBACK] and built['api_key'] == 'fake-fallback'
+    assert built['model'] == FALLBACK['model'] and built['provider'] == FALLBACK['provider']
 
 
 def test_primary_auth_failure_with_an_unusable_turn_chain_keeps_the_kanban_start_exit(tmp_path, monkeypatch):
@@ -205,9 +206,8 @@ def test_primary_auth_failure_with_an_unusable_turn_chain_keeps_the_kanban_start
 
 
 def test_keyless_worker_on_a_fallback_never_sends_its_key_to_the_primary_endpoint(tmp_path, monkeypatch):
-    """Resolution landing on a configured fallback: the real agent's primary (MiniMax, Anthropic
-    protocol) client is built without the fallback provider's key. Asserted where the HTTP client
-    is constructed; this does not drive a turn through the fallback."""
+    """Resolution landing on a configured fallback: no primary (MiniMax, Anthropic protocol)
+    client is constructed. The fallback key travels only with its endpoint and model."""
     fallback_key = 'fake-fallback-' + secrets.token_hex(8)
     monkeypatch.delenv(KEY_ENV, raising=False)
     monkeypatch.setattr('hermes_cli.runtime_provider_custom._resolve_named_custom_runtime', lambda **kw: None)
@@ -222,7 +222,7 @@ def test_keyless_worker_on_a_fallback_never_sends_its_key_to_the_primary_endpoin
     monkeypatch.setattr('agent.anthropic_adapter.build_anthropic_client', build_anthropic_client)
     from run_agent import AIAgent
     built = _execute(_minimax_frame(tmp_path, monkeypatch), monkeypatch, base=AIAgent)
-    primary = [key for key, base_url in clients if base_url == BASE_URL]
-    assert primary and fallback_key not in primary
-    assert all(fallback_key != key for key, _ in clients)
-    assert built['api_key'] is None
+    assert not clients  # No primary Anthropic-protocol client, not even an empty one.
+    assert built['api_key'] == fallback_key
+    assert built['provider'] == 'openrouter' and built['model'] == 'fallback-model'
+    assert built['base_url'] == 'https://openrouter.ai/api/v1'

@@ -428,8 +428,8 @@ def _construct_agent(frame, factory, policy, **kwargs):
     still books the one-shot exit mapping (quota wall 75, re-login 78) before the crash."""
     try:
         if kwargs['api_key'] is None:
-            from gateway.session_worker_construct import worker_api_key
-            kwargs['api_key'] = worker_api_key(policy, kwargs)
+            from gateway.session_worker_construct import worker_runtime_kwargs
+            kwargs.update(worker_runtime_kwargs(policy, kwargs))
         return factory(**kwargs)
     except Exception as exc:
         from gateway.session_kanban import record_start_failure

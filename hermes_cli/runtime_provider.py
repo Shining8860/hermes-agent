@@ -406,8 +406,11 @@ def _anthropic_token_or_raise(*, model: str | None = None) -> str:
         # A key the pool benched for *this* model is not a missing credential; telling the
         # user to re-authenticate would send them chasing a cooldown that lifts on its own.
         if model and resolve_anthropic_token():
+            # The shared quota discriminator also drives Kanban's no-budget retry (exit 75).
+            from hermes_cli.auth_constants import CODEX_RATE_LIMITED_CODE
             raise AuthError(f"Anthropic credentials are rate-limited for {model}; "
-                            "other Claude models remain available (see `hermes auth list`).")
+                            "other Claude models remain available (see `hermes auth list`).",
+                            provider="anthropic", code=CODEX_RATE_LIMITED_CODE, retryable=True)
         raise AuthError(_NO_ANTHROPIC_CREDENTIALS_MSG)
     return token
 

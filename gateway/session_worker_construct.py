@@ -151,7 +151,7 @@ def route_runtime(policy, frozen, model, key, *, fallback=True):
     """``(runtime, fallback_entry)`` for a launch-policy route: the session's FROZEN config and launch
     credential, walking its own fallback chain on an AuthError unless ``fallback=False`` (a session
     control asking which route the session itself runs). The one resolver an in-process turn
-    (``_resolve_policy_agent_runtime``) and a key-less managed worker (``worker_api_key``) share."""
+    (``_resolve_policy_agent_runtime``) and a key-less managed worker (``worker_runtime_kwargs``) share."""
     from hermes_cli.runtime_provider import (
         frozen_runtime_config, resolve_runtime_provider, resolve_runtime_with_fallback,
     )
@@ -189,20 +189,30 @@ def route_runtime(policy, frozen, model, key, *, fallback=True):
             explicit_api_key=key, explicit_base_url=launch_url, target_model=model)
 
 
-def worker_api_key(policy, construct):
-    """Child side, for a worker launched without a key (every Kanban run): the route's own credential,
-    resolved as the in-process turn resolves it, from this process's profile home (its HERMES_HOME and
-    ``.env``). A fallback entry's key belongs to another provider and model, so the primary never
-    carries it; the agent's own fallback chain switches all three together (#139155).
+def worker_runtime_kwargs(policy, construct):
+    """Resolve a key-less worker's whole route before constructing any client.
 
-    A primary AuthError walks the chain the agent will actually get: the owner's per-turn
-    ``construct_v1`` chain (an ordinary session's refreshed profile fallbacks) when it was sent,
-    the frozen snapshot's otherwise (older owner)."""
+    Model, endpoint, credential, wire mode and pool are one selection, never a fallback key
+    bolted onto the primary. Resolution failures propagate to the worker's start-exit mapping.
+    The owner's per-turn chain wins over the frozen snapshot (older owners send no chain).
+    """
+    from gateway.run import _deep_merge_request_overrides, _runtime_agent_kwargs
+    from hermes_cli.fallback_config import effective_runtime_provider
     frozen, model = policy.effective()
     if 'fallback_model' in construct:
         frozen = {**frozen, 'fallback_providers': construct['fallback_model'] or [], 'fallback_model': None}
     runtime, fallback_entry = route_runtime(policy, frozen, model, None)
-    return runtime.get('api_key') if fallback_entry is None else None
+    if fallback_entry is not None:
+        model = fallback_entry['model']
+    route = _runtime_agent_kwargs(runtime)
+    selection = fallback_entry or frozen.get('model') or {}
+    route['provider'] = effective_runtime_provider(selection, runtime)
+    # Direct aliases (e.g. openai) resolve to the custom billing class; fast-mode eligibility
+    # still needs the selected identity, with the RESOLVED model and endpoint.
+    routing = routing_agent_kwargs(frozen, model, selection.get('provider') or route['provider'], route['base_url'])
+    route['request_overrides'] = _deep_merge_request_overrides(
+        route['request_overrides'], routing['request_overrides']) or None
+    return {**routing, **route, 'model': model}
 
 
 def checkpoint_agent_kwargs(config):
