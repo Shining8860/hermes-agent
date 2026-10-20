@@ -249,8 +249,16 @@ def _setup_mcp_shim(agent, args: dict, ctx: InlineToolContext) -> Any:
     }, ctx)
 
 
+def _catalog_read(agent, args: dict, ctx: InlineToolContext, name: str) -> Any:
+    from agent.context_engine_tools import dispatch_catalog_read
+
+    return dispatch_catalog_read(agent, args, ctx, name=name)
+
+
 # Order is the historical if/elif order of ``execute_tool_calls_sequential``.
 _RAW_INLINE_TOOL_EXECUTORS: dict[str, InlineToolExecutor] = {
+    "tool_search": lambda agent, args, ctx: _catalog_read(agent, args, ctx, "tool_search"),
+    "tool_describe": lambda agent, args, ctx: _catalog_read(agent, args, ctx, "tool_describe"),
     "todo_list": _tool(
         "tools.todo_tool", "todo_tool", ("todos", "todos"), ("merge", "merge", False),
         store=lambda agent, ctx: agent._todo_store,

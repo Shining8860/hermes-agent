@@ -83,12 +83,16 @@ def _publish_tool_snapshot(
         agent._tool_snapshot_generation = max(published_gen, snapshot_generation)
         # Same name set: nothing to publish, unless the caller is content_aware
         # (explicit reload, compaction) and the serialized schema bytes moved.
-        if new_names == current and not (content_aware and _tool_defs_content_changed(agent, new_defs)):
+        # Deferred engine membership can change without changing the wire names/bytes
+        # (in particular when preserve_prefix keeps the old bridge manifest).
+        engine_names = getattr(agent, "_context_engine_tool_names", None)
+        routing_changed = isinstance(engine_names, set) and engine_names != staged_engine_names
+        if (new_names == current and not routing_changed
+                and not (content_aware and _tool_defs_content_changed(agent, new_defs))):
             return None
         agent.tools = new_defs
         agent.valid_tool_names = new_names
         # Publish context-engine routing names atomically with the snapshot.
-        engine_names = getattr(agent, "_context_engine_tool_names", None)
         if isinstance(engine_names, set):
             engine_names.clear()
             engine_names.update(staged_engine_names)
@@ -321,16 +325,10 @@ def _reinject_post_build_tools(agent, tools_list: list, name_set: set) -> set:
     except Exception:
         logger.debug("Memory-provider tool re-injection skipped", exc_info=True)
 
-    # The `context_engine` toolset is intentionally empty, so lcm_* tools exist only via this
-    # append. Honor the enabled_toolsets gate agent_init uses, or a restricted-toolset platform
-    # would re-leak tools the build excluded.
-    # See #5544.
     staged_engine_names: set = set()
     try:
-        get_schemas = _schema_getter("context_compressor", "get_tool_schemas")
-        if (enabled is None or "context_engine" in enabled) and get_schemas is not None:
-            # Claim the routing name only when WE appended the schema.
-            staged_engine_names.update(s["name"] for s in get_schemas() if _add(s))
+        from agent.context_engine_tools import inject_engine_tools
+        staged_engine_names = inject_engine_tools(agent, tools_list, name_set)
     except Exception:
         logger.debug("Context-engine tool re-injection skipped", exc_info=True)
     return staged_engine_names

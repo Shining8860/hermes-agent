@@ -374,9 +374,14 @@ def _tool_search_scoped_names(agent) -> frozenset:
         frozenset(enabled) if enabled is not None else None,
         frozenset(disabled) if disabled is not None else None,
     )
+    from agent.context_engine_tools import engine_tool_defs
+    engine_names = _ts.scoped_deferrable_names([
+        td for td in engine_tool_defs(agent)
+        if td["function"]["name"] in getattr(agent, "_context_engine_tool_names", set())
+    ])
     cached = getattr(agent, "_tool_search_scope_cache", None)
     if cached is not None and cached[0] == cache_key:
-        return cached[1]
+        return cached[1] | engine_names
     try:
         names = _ts.scoped_deferrable_names(model_tools.get_tool_definitions(
             enabled_toolsets=enabled, disabled_toolsets=disabled, quiet_mode=True, skip_tool_search_assembly=True,
@@ -385,7 +390,7 @@ def _tool_search_scoped_names(agent) -> frozenset:
         names = frozenset()
     with contextlib.suppress(Exception):
         agent._tool_search_scope_cache = (cache_key, names)
-    return names
+    return names | engine_names
 
 
 def _canonical_tool_name(function_name: str) -> str:
@@ -429,7 +434,11 @@ def _unwrap_tool_search_call(
             )
         # Validate before unwrapping: the generic bridge hides the concrete
         # parameter schema from provider-native tool-call validation.
-        scope_block = _ts.validate_deferred_call_args(underlying, underlying_args)
+        from agent.context_engine_tools import engine_tool_defs
+        engine_schema = next((td for td in engine_tool_defs(agent)
+                              if td["function"]["name"] == underlying
+                              and underlying in getattr(agent, "_context_engine_tool_names", set())), None)
+        scope_block = _ts.validate_deferred_call_args(underlying, underlying_args, schema=engine_schema)
         if scope_block is None:
             return underlying, underlying_args, None
         if flatten_probe:
