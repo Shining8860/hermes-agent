@@ -210,6 +210,57 @@ def test_deferred_lcm_tool_is_catalogued_and_executable(refresh):
         assert len(engine.calls) == 1
 
 
+@pytest.mark.parametrize("mode,dropped", [
+    ("side", "manage_connections"), ("oneshot", "skill_manage"), ("interactive", None),
+])
+@pytest.mark.parametrize("deferred", [False, True])
+def test_engine_disclosure_preserves_session_tool_drops(monkeypatch, mode, dropped, deferred):
+    """Reassembly must not restore excluded tools, even through the deferred catalog."""
+    from agent.context_engine_tools import catalog_tool_defs
+    from run_agent import AIAgent
+
+    monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1" if mode == "oneshot" else "0")
+    engine = _DeferredToolEngine()
+    guarded = {"manage_connections", "skill_manage"}
+    registry_defs = [{"type": "function", "function": {
+        "name": name, "description": f"Session tool {name}.",
+        "parameters": {"type": "object", "properties": {}},
+    }} for name in sorted(guarded | {"registry_lookup"})]
+    cfg = {
+        "context": {"engine": "stub"}, "agent": {},
+        "tools": {"tool_search": {"defer": ["lcm_inspect", "registry_lookup",
+                                              *(sorted(guarded) if deferred else [])]}},
+    }
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("hermes_cli.config.load_config_readonly", return_value=cfg),
+        patch("plugins.context_engine.load_context_engine", return_value=engine),
+        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+        patch("model_tools.get_tool_definitions", return_value=registry_defs),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-key-1234567890", base_url="https://openrouter.ai/api/v1",
+            enabled_toolsets=["context_engine"], side_agent=(mode == "side"),
+            quiet_mode=True, skip_context_files=True, skip_memory=True,
+        )
+        names = {t["function"]["name"] for t in agent.tools}
+        catalog = {t["function"]["name"] for t in catalog_tool_defs(agent)}
+        manifest = next(t["function"]["description"] for t in agent.tools
+                        if t["function"]["name"] == "tool_search")
+        assert "stub_recover" in names
+        assert {"registry_lookup", "lcm_inspect"} <= catalog
+        for name in guarded - {dropped}:
+            assert name in catalog
+            assert (name in names) is not deferred
+        if dropped:
+            assert dropped not in names
+            assert dropped not in agent.valid_tool_names
+            assert dropped not in catalog
+            assert dropped not in manifest
+
+
 @pytest.mark.parametrize("settings", [
     {"defer": []}, {"enabled": "off", "defer": ["lcm_inspect"]},
 ])

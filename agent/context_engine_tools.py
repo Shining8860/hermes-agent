@@ -30,6 +30,16 @@ def engine_tool_defs(agent) -> list:
     return definitions
 
 
+def _session_tool_defs(agent, definitions) -> list:
+    """Re-reading the registry must not bypass the session's tool exclusions."""
+    from agent.oneshot_footprint import prune_oneshot_tools
+    from toolsets import agent_tool_drops
+
+    drops = agent_tool_drops(agent)
+    return [td for td in prune_oneshot_tools(definitions)
+            if td["function"]["name"] not in drops]
+
+
 def catalog_tool_defs(agent) -> list:
     """Registry catalog plus only the engine names owned by THIS agent."""
     from model_tools import get_tool_definitions
@@ -43,7 +53,7 @@ def catalog_tool_defs(agent) -> list:
     owned = getattr(agent, "_context_engine_tool_names", set())
     definitions.extend(td for td in engine_tool_defs(agent)
                        if td["function"]["name"] in owned and td["function"]["name"] not in registered)
-    return definitions
+    return _session_tool_defs(agent, definitions)
 
 
 def inject_engine_tools(agent, tools_list: list, name_set: set) -> set:
@@ -68,14 +78,15 @@ def inject_engine_tools(agent, tools_list: list, name_set: set) -> set:
         if name not in definitions:
             definitions[name] = td
             owned.add(name)
+    session_defs = _session_tool_defs(agent, definitions.values())
     tools_list[:] = assemble_tool_defs(
-        list(definitions.values()),
+        session_defs,
         context_length=getattr(agent.context_compressor, "context_length", None),
         config=load_config_readonly(),
     ).tool_defs
     name_set.clear()
     name_set.update(td["function"]["name"] for td in tools_list)
-    return owned
+    return owned & {td["function"]["name"] for td in session_defs}
 
 
 def dispatch_catalog_read(agent, args, ctx, *, name):
