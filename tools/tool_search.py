@@ -52,6 +52,9 @@ class ToolSearchConfig:
     listing_max_tokens: int = 4000  # budget = min(this, threshold_pct% of context)
     # None = curated default; an explicit list replaces it wholesale ([] = defer no core tools).
     defer_tools: Optional[frozenset] = None
+    # HermesOps overlay: tools that must stay on the direct surface even when they would
+    # otherwise defer (plugin/memory-provider tools such as mnemosyne_remember).
+    eager_tools: frozenset = frozenset()
 
     @property
     def effective_defer_tools(self) -> frozenset:
@@ -82,7 +85,8 @@ class ToolSearchConfig:
             listing=_tri_state(raw.get("listing", "auto")),
             listing_max_tokens=_clamped_int(raw.get("listing_max_tokens"), 4000, 200, 60000),
             defer_tools=(frozenset(str(n).strip() for n in defer_raw if str(n).strip())
-                         if isinstance(defer_raw, (list, tuple, set)) else None))
+                         if isinstance(defer_raw, (list, tuple, set)) else None),
+            eager_tools=_name_set(raw.get("eager")))
 
 
 _TRI_STATE_ALIASES = {"true": "on", "1": "on", "yes": "on", "false": "off", "0": "off", "no": "off"}
@@ -92,6 +96,13 @@ def _tri_state(value: Any) -> str:
     """Normalize an ``auto``/``on``/``off`` setting (bool-ish aliases accepted)."""
     text = str(value).strip().lower()
     return _TRI_STATE_ALIASES.get(text, text if text in ("auto", "on", "off") else "auto")
+
+
+def _name_set(value: Any) -> frozenset:
+    """Stripped non-empty names of a YAML list; anything else is an empty set."""
+    if not isinstance(value, (list, tuple, set)):
+        return frozenset()
+    return frozenset(str(n).strip() for n in value if str(n).strip())
 
 
 def _clamped_int(value: Any, fallback: int, lo: int, hi: int) -> int:
@@ -147,11 +158,16 @@ _DIRECT_SURFACE_TOOLSETS = CLIENT_SURFACE_TOOLSETS | TOOLSET_SESSION_PLATFORMS.k
 _DEFAULT_DEFERRED_TOOLS = frozenset(DEFAULT_CONFIG["tools"]["tool_search"]["defer"])
 
 
-def is_deferrable_tool_name(name: str, defer_tools: Optional[frozenset] = None) -> bool:
+def is_deferrable_tool_name(name: str, defer_tools: Optional[frozenset] = None,
+                            eager_tools: Optional[frozenset] = None) -> bool:
     """True if a tool is *eligible* for deferral: named in ``defer_tools`` (curated set or
     user override), OR an MCP tool, OR neither core nor a session-gated GUI surface (i.e. a
-    plugin tool). Bridge names never defer."""
+    plugin tool). Bridge names and ``tools.tool_search.eager`` names never defer."""
     if name in BRIDGE_TOOL_NAMES:
+        return False
+    if eager_tools is None:
+        eager_tools = load_config_readonly().eager_tools
+    if name in eager_tools:
         return False
     if defer_tools is not None and name in defer_tools:
         return True
@@ -180,9 +196,11 @@ def classify_tools(tool_defs: list[dict[str, Any]], defer_tools: Optional[frozen
     after classification)."""
     visible: list[dict[str, Any]] = []
     deferrable: list[dict[str, Any]] = []
+    eager_tools = load_config_readonly().eager_tools
     for td, name in zip(tool_defs, _tool_def_names(tool_defs)):
         if name not in BRIDGE_TOOL_NAMES:
-            (deferrable if is_deferrable_tool_name(name, defer_tools) else visible).append(td)
+            (deferrable if is_deferrable_tool_name(name, defer_tools, eager_tools)
+             else visible).append(td)
     return visible, deferrable
 
 

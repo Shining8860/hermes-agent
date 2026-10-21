@@ -886,3 +886,14 @@ class TestDeferredCallSchemaProbe:
         }, calls)
 
         assert validate_deferred_call_args(name, {"payload": {"anything": True}}) is None
+
+
+def test_eager_list_keeps_plugin_tools_direct():
+    """HermesOps overlay: ``tools.tool_search.eager`` pins plugin tools to the direct surface."""
+    from tools.tool_search import ToolSearchConfig, is_deferrable_tool_name
+    cfg = ToolSearchConfig.from_raw({"eager": ["mnemosyne_remember", " ", "mnemosyne_recall"]})
+    assert cfg.eager_tools == {"mnemosyne_remember", "mnemosyne_recall"}
+    assert ToolSearchConfig.from_raw({"eager": "x"}).eager_tools == frozenset()
+    eager = cfg.eager_tools
+    assert is_deferrable_tool_name("mnemosyne_remember", frozenset({"mnemosyne_remember"}), eager) is False
+    assert is_deferrable_tool_name("mnemosyne_forget", frozenset({"mnemosyne_forget"}), eager) is True
