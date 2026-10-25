@@ -1,6 +1,6 @@
 """Pin/lock consistency for the website's nanoid override.
 
-GHSA-2v37-7h3g-55p8 / CVE-2026-67213 affects nanoid <3.3.18 on the 3.x line.
+GHSA-2v37-7h3g-55p8 / CVE-2026-67213 is covered by upstream's nanoid 3.3.20 pin.
 The website is a standalone npm project, not a root workspace, so the root
 override (package.json "nanoid@^3") does not reach it. This test keeps the
 website override and every website lock resolution on the patched release, so
@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 
 WEBSITE = Path(__file__).resolve().parents[1] / "website"
-PATCHED_NANOID = "3.3.18"
+PATCHED_NANOID = "3.3.20"
 
 
 def _load(name):

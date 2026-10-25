@@ -1,4 +1,7 @@
 """The workspace and admission paths agree on scoped keys and disabled plugins."""
+import sys
+from pathlib import Path
+
 import pytest
 
 from pm.package import InstallError
@@ -13,7 +16,7 @@ def test_scoped_members_respect_disabled_and_keep_other_profiles(tmp_path, monke
     other = other_home / "plugins" / "same"
     for member in (current, other):
         member.mkdir(parents=True)
-        (member / "pyproject.toml").write_text('[project]\nname="test"\nversion="1"\n')
+        (member / "pyproject.toml").write_text('[project]\nname="test"\nversion="1"\ndependencies=["requests>=2"]\n')
     (home / "config.yaml").write_text('plugins:\n  enabled: [group/plugin]\n  disabled: []\n')
     (other_home / "config.yaml").write_text('plugins:\n  enabled: [same]\n')
     assert set(enabled_member_dirs()) == {current, other}
@@ -134,7 +137,7 @@ def test_identical_buildable_members_across_profiles_are_deduplicated(tmp_path):
         plugins.append(plugin)
 
     root = tmp_path / "generation"
-    _generate_pyproject(plugins, root, source=source)
+    _generate_pyproject(plugins, root, source=source, python=Path(sys.executable))
     document = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
     assert len(document["tool"]["uv"]["workspace"]["members"]) == 1
 
@@ -219,6 +222,7 @@ def test_seed_lock_keeps_existing_deduplicated_buildable_member(tmp_path, packag
         shutil.copytree(retained, staging)
         entries = {identity: staging if identity == retained else identity for identity in entries}
     environment = Mock(spec=PythonEnvironment)
+    environment.python = Path(sys.executable)
     environment.sync.side_effect = check_sync
     lock_and_sync(entries, [], root=tmp_path / "generation", source=source,
                   seed_lock=seed, environment=environment)
@@ -310,7 +314,8 @@ def test_divergent_buildable_members_across_profiles_fail_closed(tmp_path, prefe
             encoding="utf-8",
         )
     with pytest.raises(InstallError, match="differs across profiles"):
-        _generate_pyproject(plugins, tmp_path / "generation", source=source, seed_lock=seed)
+        _generate_pyproject(plugins, tmp_path / "generation", source=source,
+                            python=Path(sys.executable), seed_lock=seed)
 
 
 def test_virtual_member_without_project_metadata_gets_a_version(tmp_path):
