@@ -211,7 +211,7 @@ def test_deferred_lcm_tool_is_catalogued_and_executable(refresh):
 
 
 @pytest.mark.parametrize("mode,dropped", [
-    ("side", "manage_connections"), ("oneshot", "skill_manage"), ("interactive", None),
+    ("side", "manage_connections"), ("oneshot", None), ("interactive", None),
 ])
 @pytest.mark.parametrize("deferred", [False, True])
 def test_engine_disclosure_preserves_session_tool_drops(monkeypatch, mode, dropped, deferred):

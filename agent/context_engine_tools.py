@@ -32,12 +32,9 @@ def engine_tool_defs(agent) -> list:
 
 def _session_tool_defs(agent, definitions) -> list:
     """Re-reading the registry must not bypass the session's tool exclusions."""
-    from agent.oneshot_footprint import prune_oneshot_tools
-    from toolsets import agent_tool_drops
+    from toolsets import agent_tool_surface
 
-    drops = agent_tool_drops(agent)
-    return [td for td in prune_oneshot_tools(definitions)
-            if td["function"]["name"] not in drops]
+    return agent_tool_surface(agent, definitions)
 
 
 def catalog_tool_defs(agent) -> list:
