@@ -39,9 +39,9 @@ class RerereUpdateMergeTests(unittest.TestCase):
             ["git", *args], cwd=self.repo, text=True, capture_output=True, check=check
         )
 
-    def train(self):
+    def train(self, resolution="reviewed combined resolution\n"):
         self.assertEqual(self.git("merge", "origin/main", check=False).returncode, 1)
-        self.file.write_text("reviewed combined resolution\n")
+        self.file.write_text(resolution)
         self.git("rerere")
         self.git("merge", "--abort")
 
@@ -64,6 +64,30 @@ class RerereUpdateMergeTests(unittest.TestCase):
         self.assertEqual(
             parents[2], self.git("rev-parse", "origin/main").stdout.strip()
         )
+        self.assertEqual(self.git("status", "--porcelain").stdout, "")
+
+    def test_upstream_eof_whitespace_does_not_reject_clean_resolution(self):
+        self.git("switch", "main")
+        inherited = self.repo / "upstream whitespace.txt"
+        inherited.write_text("inherited upstream\n\n")
+        self.git("add", ".")
+        self.git("commit", "-m", "upstream EOF whitespace")
+        self.git("update-ref", "refs/remotes/origin/main", "HEAD")
+        self.git("switch", "overlay")
+        self.train()
+        self.reconcile()
+        self.assertEqual(inherited.read_text(), "inherited upstream\n\n")
+        self.assertEqual(self.file.read_text(), "reviewed combined resolution\n")
+        self.assertEqual(self.git("status", "--porcelain").stdout, "")
+        self.assertEqual(
+            self.git("diff", "--check", "HEAD^", "HEAD", check=False).returncode, 2
+        )
+
+    def test_rerere_introduced_whitespace_still_aborts(self):
+        self.train("reviewed combined resolution \n")
+        with self.assertRaises(SystemExit):
+            self.reconcile()
+        self.assertEqual(self.git("rev-parse", "HEAD").stdout.strip(), self.before)
         self.assertEqual(self.git("status", "--porcelain").stdout, "")
 
     def test_unknown_conflict_still_aborts_and_preserves_local_head(self):

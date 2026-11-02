@@ -20,6 +20,7 @@ def finish_rerere_merge(git_run, git_cmd) -> bool:
         return False
     if git_run(git_cmd, ["diff", "--quiet"]).returncode:
         return False
-    if git_run(git_cmd, ["diff", "--cached", "--check"]).returncode:
+    # Check our additions relative to upstream, not upstream's inherited whitespace.
+    if git_run(git_cmd, ["diff", "--cached", "--check", "MERGE_HEAD"]).returncode:
         return False
     return git_run(git_cmd, ["commit", "--no-edit"]).returncode == 0
