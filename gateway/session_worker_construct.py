@@ -151,7 +151,7 @@ def route_runtime(policy, frozen, model, key, *, fallback=True):
     """``(runtime, fallback_entry)`` for a launch-policy route: the session's FROZEN config and launch
     credential, walking its own fallback chain on an AuthError unless ``fallback=False`` (a session
     control asking which route the session itself runs). The one resolver an in-process turn
-    (``_resolve_policy_agent_runtime``) and a key-less managed worker (``worker_runtime_kwargs``) share."""
+    (``_resolve_policy_agent_runtime``) and a managed worker (``worker_route``) share."""
     from hermes_cli.runtime_provider import (
         frozen_runtime_config, resolve_runtime_provider, resolve_runtime_with_fallback,
     )
@@ -189,8 +189,8 @@ def route_runtime(policy, frozen, model, key, *, fallback=True):
             explicit_api_key=key, explicit_base_url=launch_url, target_model=model)
 
 
-def worker_runtime_kwargs(policy, construct):
-    """Resolve a key-less worker's whole route before constructing any client.
+def worker_route(policy, construct):
+    """Resolve a worker's route before constructing any client.
 
     Model, endpoint, credential, wire mode and pool are one selection, never a fallback key
     bolted onto the primary. Resolution failures propagate to the worker's start-exit mapping.
@@ -201,11 +201,21 @@ def worker_runtime_kwargs(policy, construct):
     frozen, model = policy.effective()
     if 'fallback_model' in construct:
         frozen = {**frozen, 'fallback_providers': construct['fallback_model'] or [], 'fallback_model': None}
-    runtime, fallback_entry = route_runtime(policy, frozen, model, None)
+    runtime, fallback_entry = route_runtime(policy, frozen, model, construct['api_key'])
+    if construct['api_key'] is not None and fallback_entry is not None:
+        return {}
+    selection = fallback_entry or frozen.get('model') or {}
+    api_mode = runtime.get('api_mode')
+    # Built-in chat_completions is a default; custom endpoint modes are explicit.
+    if (fallback_entry is None and api_mode == 'chat_completions' and runtime.get('provider') != 'custom'
+            and not selection.get('api_mode')):
+        api_mode = None
+    if construct['api_key'] is not None:
+        return {'api_key': construct['api_key'], 'base_url': runtime.get('base_url'), 'api_mode': api_mode}
     if fallback_entry is not None:
         model = fallback_entry['model']
     route = _runtime_agent_kwargs(runtime)
-    selection = fallback_entry or frozen.get('model') or {}
+    route['api_mode'] = api_mode
     route['provider'] = effective_runtime_provider(selection, runtime)
     # Direct aliases (e.g. openai) resolve to the custom billing class; fast-mode eligibility
     # still needs the selected identity, with the RESOLVED model and endpoint.

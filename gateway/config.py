@@ -379,7 +379,7 @@ def persist_home_channel(home: HomeChannel, *, enabled_if_new: bool = False) -> 
 # at WARNING (once per entry) instead of being dropped in silence: an operator who writes a plausible
 # but unknown key (``disable_toolsets``, ``toolsets``, ``system_prompts``) previously got no effect and
 # no signal at all — the restriction they configured simply never applied.
-CHANNEL_OVERRIDE_KEYS = frozenset({"model", "provider", "system_prompt", "disabled_toolsets"})
+CHANNEL_OVERRIDE_KEYS = frozenset({"model", "provider", "system_prompt", "disabled_toolsets", "allow_silence"})
 # Wildcard key in ``channel_overrides``: its deny list applies to every GROUP chat of the platform.
 # DMs are matched by exact id only — a wildcard must never restrict (or be read as applying to) a
 # private chat, and ``chat_type`` is the adapter's own statement of which one this is.
@@ -514,6 +514,7 @@ class ChannelOverride:
     provider: Optional[str] = None
     system_prompt: Optional[str] = None
     disabled_toolsets: list[str] = field(default_factory=list)
+    allow_silence: Optional[bool] = None
 
     def to_dict(self) -> dict[str, Any]:
         # Round-trip: an empty deny list is omitted (it restricts nothing), never emitted as ``[]``,
@@ -539,6 +540,7 @@ class ChannelOverride:
             provider=data.get("provider"),
             system_prompt=data.get("system_prompt"),
             disabled_toolsets=_normalise_deny_toolsets(data.get("disabled_toolsets")),
+            allow_silence=data.get("allow_silence"),
         )
 
 
