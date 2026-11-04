@@ -74,7 +74,7 @@ def test_pyproject_member_is_renamed_by_its_key_and_stays_unique(tmp_path):
     assert document["project"]["dependencies"] == ["hindsight-client>=0.10.1"]
 
 
-def test_tooling_only_pyproject_becomes_a_valid_virtual_member(tmp_path):
+def test_tooling_only_pyproject_uses_manifest_metadata_without_rewriting_source(tmp_path):
     import tomllib
     from pm.workspace import _workspace_member
 
@@ -91,7 +91,10 @@ def test_tooling_only_pyproject_becomes_a_valid_virtual_member(tmp_path):
     assert document["project"]["name"].startswith("hermes-plugin-tooling-only-")
     assert document["project"]["version"] == "0.0.0"
     assert document["project"]["requires-python"] == ">=3.11"
-    assert document["tool"]["ruff"]["target-version"] == "py311"
+    # Upstream treats tool-only pyprojects as manifest members, not package inputs.
+    assert member.parent.name == "plugin-deps"
+    original = tomllib.loads((plugin / "pyproject.toml").read_text(encoding="utf-8"))
+    assert original == {"tool": {"ruff": {"target-version": "py311"}}}
 
 
 def test_buildable_pyproject_member_keeps_its_declared_name(tmp_path):
@@ -195,6 +198,7 @@ def test_seed_lock_keeps_existing_deduplicated_buildable_member(tmp_path, packag
         plugin.mkdir(parents=True)
         (plugin / "pyproject.toml").write_text(
             '[project]\nname = "same-plugin"\nversion = "1"\n'
+            '[project.optional-dependencies]\nruntime = []\ndev = ["unused-dev-pin==1"]\n'
             + ('[build-system]\nrequires = []\nbuild-backend = "backend"\n'
                if package_mode == "backend" else '[tool.uv]\npackage = true\n'),
             encoding="utf-8",
@@ -214,6 +218,9 @@ def test_seed_lock_keeps_existing_deduplicated_buildable_member(tmp_path, packag
         document = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
         assert document["tool"]["uv"]["workspace"]["members"] == [expected]
         assert (root / expected / "pyproject.toml").is_file()
+        member = tomllib.loads((root / expected / "pyproject.toml").read_text(encoding="utf-8"))
+        assert member["project"]["optional-dependencies"] == {"runtime": []}
+        assert extras == ["runtime"]
         assert (root / "uv.lock").read_text(encoding="utf-8") == seed_text
 
     entries = list(reversed(plugins)) if reverse else plugins
@@ -224,7 +231,7 @@ def test_seed_lock_keeps_existing_deduplicated_buildable_member(tmp_path, packag
     environment = Mock(spec=PythonEnvironment)
     environment.python = Path(sys.executable)
     environment.sync.side_effect = check_sync
-    lock_and_sync(entries, [], root=tmp_path / "generation", source=source,
+    lock_and_sync(entries, ["runtime"], root=tmp_path / "generation", source=source,
                   seed_lock=seed, environment=environment)
     environment.sync.assert_called_once()
     assert seed.read_text(encoding="utf-8") == seed_text
@@ -378,3 +385,23 @@ def test_buildable_member_without_a_version_gets_one_and_keeps_its_name(tmp_path
     member = _workspace_member(plugin, root, identity=plugin)
     project = tomllib.loads((member / "pyproject.toml").read_text(encoding="utf-8"))["project"]
     assert project == {"name": "noversion-plugin", "version": "0.0.0"}
+
+
+def test_tooling_only_pyproject_with_dev_group_stages_the_manifest_dependencies(tmp_path):
+    """A pyproject with no [project] table (lint config plus a dev group) is not the plugin's
+    package: the generated member carries plugin.yaml's dependencies, not the dev group."""
+    import tomllib
+    from pm.workspace import _workspace_member
+
+    plugin = tmp_path / "home" / "plugins" / "hermes-lcm"
+    plugin.mkdir(parents=True)
+    (plugin / "plugin.yaml").write_text("name: hermes-lcm\npip_dependencies: ['fixturedep>=1,<2']\n",
+                                        encoding="utf-8")
+    (plugin / "pyproject.toml").write_text(
+        '[tool.ruff]\ntarget-version = "py311"\n[dependency-groups]\ndev = ["ruff"]\n', encoding="utf-8")
+    root = tmp_path / "gen"
+    root.mkdir()
+    document = tomllib.loads((_workspace_member(plugin, root, identity=plugin) / "pyproject.toml").read_text(
+        encoding="utf-8"))
+    assert document["project"]["dependencies"] == ["fixturedep>=1,<2"]
+    assert "dependency-groups" not in document
