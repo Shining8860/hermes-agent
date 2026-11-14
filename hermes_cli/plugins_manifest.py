@@ -12,7 +12,7 @@ import re
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Set, Tuple, Union
 
 from utils import fast_safe_load
 from hermes_cli.plugin_capabilities import parse_declared_capabilities as _parse_declared_capabilities
@@ -357,6 +357,25 @@ def manifest_key(manifest: PluginManifest) -> str:
     return manifest.key or manifest.name
 
 
+def plugin_identity_names(key: str, name: str, installed_dir: Optional[str] = None) -> set[str]:
+    """Spellings an installed plugin may claim, before collision resolution."""
+    from hermes_cli.left_core_migration import legacy_plugin_keys
+    return {key, key.rsplit("/", 1)[-1], name, *legacy_plugin_keys(key)} | ({installed_dir} if installed_dir else set())
+
+
+def plugin_selection_owners(identities: Mapping[str, Iterable[str]]) -> dict[str, Optional[str]]:
+    """Canonical keys win; noncanonical aliases select exactly one owner or fail closed (None)."""
+    owners: dict[str, Optional[str]] = {}
+    for key, names in identities.items():
+        for alias in names:
+            if alias not in owners:
+                owners[alias] = key
+            elif owners[alias] != key:
+                owners[alias] = None
+    owners.update({key: key for key in identities})
+    return owners
+
+
 @dataclass
 class PluginManifest:
     """Parsed representation of a plugin.yaml manifest."""
@@ -378,6 +397,8 @@ class PluginManifest:
     # Path-derived registry key used by plugins.enabled/disabled and `hermes plugins list`: ``disk-cleanup``
     # for a flat plugin, ``image_gen/openai`` for a category plugin. Empty -> name.
     key: str = ""
+    # Discovery binds the complete winning inventory once; aliases cannot steal another key.
+    selection_owners: Optional[dict[str, Optional[str]]] = field(default=None, repr=False, compare=False)
     # Hermes version requirement (``">=0.19"``, comma-separated clauses allowed). Unsatisfied plugins are
     # recorded with an error and skipped before import — see ``requires_hermes_error``.
     requires_hermes: str = ""
@@ -516,13 +537,13 @@ def portable_plugin_manifest(child: Path, source: str, prefix: str) -> PluginMan
     data, diagnostics = read_agent_plugin_manifest(child)
     for diagnostic in diagnostics:
         logger.warning("Agent Plugin '%s': %s", child, diagnostic.message)
-    key = f"{prefix}/{child.name}" if prefix else child.name
-    # Selection normalization must not move existing portable plugin data.
-    namespace_key = key if prefix else data["name"]
+    # A portable package is addressed by its declared name, not the directory it was unpacked into;
+    # the directory stays an accepted alias (see plugin_identity_names).
+    key = f"{prefix}/{child.name}" if prefix else data["name"]
     return PluginManifest(
         name=data["name"], version=data.get("version", ""), description=data.get("description", ""),
         author=_display_author(data.get("author", "")), source=source, path=str(child), key=key,
-        portable=True, data_namespace=_portable_data_namespace(namespace_key),
+        portable=True, data_namespace=_portable_data_namespace(key),
         config_schema=_config_schema_entries(key, manifest_config_schema(data)),
         config_keys=manifest_config_keys(manifest_hermes_extension(data), key),
     )

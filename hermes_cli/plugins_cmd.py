@@ -552,22 +552,18 @@ def ensure_basic_auth_plugin_enabled_in_config(cfg: dict) -> bool:
     return True
 
 
-def _discard_key_and_leaf(names: set, key: str) -> None:
-    """Drop *key* and its bare leaf (``web/exa`` -> ``exa``) from *names*, so a
-    stale legacy bare-name entry can't keep vetoing the canonical key."""
-    names.discard(key)
-    names.discard(key.split("/")[-1])
-
-
 def _plugin_aliases(key: str, entries: Optional[list] = None) -> set:
-    """Every spelling a config list may hold for *key*: the key, its bare leaf and the manifest name.
-    The loader matches BOTH the canonical key (``web/firecrawl``) and the manifest name
-    (``web-firecrawl``), so a stale entry under any form vetoes an enable ("explicit disable wins").
-    Pass *entries* to reuse one :func:`_discover_all_plugins` scan across several keys."""
-    from hermes_cli.left_core_migration import legacy_plugin_keys
-    names = {key, key.split("/")[-1], *legacy_plugin_keys(key)}
-    names.update(e[0] for e in (_discover_all_plugins() if entries is None else entries) if e[5] == key)
-    return names
+    """Only unambiguous spellings owned by *key*, never another installed canonical key."""
+    from hermes_cli.plugins_manifest import plugin_identity_names, plugin_selection_owners
+    identities = _selection_identities(_discover_all_plugins() if entries is None else entries)
+    identities.setdefault(key, plugin_identity_names(key, key))
+    return {name for name, owner in plugin_selection_owners(identities).items() if owner == key}
+
+
+def _selection_identities(entries: list) -> dict:
+    """Installed ``key -> every spelling it may claim`` for the shared precedence contract."""
+    from hermes_cli.plugins_manifest import plugin_identity_names
+    return {e[5]: plugin_identity_names(e[5], e[0], Path(e[4]).name if e[4] else None) for e in entries}
 
 
 def _activate_key(key: str, *, enable: bool, console=None) -> bool:
@@ -672,8 +668,17 @@ def _refuse_recalled_entry(entry: Optional[tuple]) -> None:
 
 def _apply_activation(enabled: set, disabled: set, key: str, aliases, *, enable: bool) -> None:
     """Keep only canonical *key* in the target list and purge its spellings from the other."""
+    from hermes_cli.plugins_manifest import plugin_identity_names, plugin_selection_owners
+    identities = _selection_identities(_discover_all_plugins())
+    identities.setdefault(key, plugin_identity_names(key, key))
+    owners = plugin_selection_owners(identities)
+    ambiguous = {name for name in identities[key] if owners.get(name) is None}
+    if ambiguous & (enabled | disabled):
+        raise PluginOperationError(
+            f"Plugin '{key}' has ambiguous selection aliases: {', '.join(sorted(ambiguous & (enabled | disabled)))}; "
+            "replace those entries with explicit installed keys first")
+    aliases = {name for name in {key, *aliases} if owners.get(name, key) == key}
     removed = disabled if enable else enabled
-    _discard_key_and_leaf(removed, key)
     removed.difference_update(aliases)
     target = enabled if enable else disabled
     target.difference_update(aliases)
@@ -709,19 +714,10 @@ def _find_plugin_entry(name: str) -> Optional[tuple]:
     ``web/exa``) only when unique; else the catalog name the plugin was installed under.
     Never guesses between two candidates."""
     entries = _discover_all_plugins()
-    from hermes_cli.left_core_migration import legacy_plugin_alias
-    target = legacy_plugin_alias(name) or name  # ``observability/langfuse`` -> its catalog plugin
-    exact = next((entry for entry in entries if target == entry[5]), None)
-    if exact is None:
-        matches = [entry for entry in entries if target == entry[0]]
-        if len(matches) > 1:
-            return None
-        exact = matches[0] if matches else None
-    if exact is not None:
-        return exact
-    leaf_matches = [entry for entry in entries if name == entry[5].split("/")[-1]]
-    if leaf_matches:
-        return leaf_matches[0] if len(leaf_matches) == 1 else None
+    from hermes_cli.plugins_manifest import plugin_selection_owners
+    owners = plugin_selection_owners(_selection_identities(entries))
+    if name in owners:
+        return next((entry for entry in entries if entry[5] == owners[name]), None)
     target = _catalog_installed_dir(name)
     return next((entry for entry in entries if target is not None and entry[4] and Path(str(entry[4])) == target),
                 None)
@@ -827,7 +823,9 @@ def _read_manifest_info(d: Path, prefix: str):
         if not isinstance(manifest, dict):
             manifest = {}
         name = manifest.get("name", d.name)
-    key = f"{prefix}/{d.name}" if prefix else d.name
+    # A portable package keeps the name it declares; a native manifest is keyed by its directory.
+    portable = manifest_file is None
+    key = f"{prefix}/{d.name}" if prefix else (name if portable else d.name)
     return name, manifest.get("version", ""), manifest.get("description", ""), key
 
 

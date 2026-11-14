@@ -898,11 +898,13 @@ def test_portable_manifest_is_visible_to_plugin_cli(tmp_path):
         )
     )
 
+    # The key is the name the loader keys the portable plugin by (``PluginManager._plugins``),
+    # not the directory it was unpacked into; the directory remains an accepted alias.
     assert _read_manifest_info(plugin, "") == (
         "portable.test",
         "1.0.0",
         "Portable test plugin",
-        "portable",
+        "portable.test",
     )
 
 

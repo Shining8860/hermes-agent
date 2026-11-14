@@ -20,7 +20,7 @@ from hermes_cli.plugin_capabilities import VALID_CAPABILITY_IDS
 from hermes_cli.plugin_capabilities import parse_declared_capabilities as _parse_declared_capabilities
 from hermes_cli.plugins_manifest import (
     PluginManifest, _detect_kind_from_source, manifest_key, _resolve_module_source,
-    parse_manifest_file, portable_plugin_manifest,
+    parse_manifest_file, portable_plugin_manifest, plugin_identity_names, plugin_selection_owners,
 )
 from hermes_cli.relay_plugin_cutover import LEGACY_RELAY_PLUGIN_KEYS, RELAY_PLUGINS_CONFIG_ENV
 
@@ -242,6 +242,11 @@ def resolve_manifest_winners(manifests: list[PluginManifest]) -> dict[str, Plugi
             logger.info("Plugin '%s' at %s (%s) shadows the bundled copy at %s", key, manifest.path,
                         manifest.source, shadowed.path)
         winners[key] = manifest
+    owners = plugin_selection_owners({
+        key: plugin_identity_names(key, m.name, Path(m.path).name if m.path else None)
+        for key, m in winners.items()})
+    for manifest in winners.values():
+        manifest.selection_owners = owners
     return winners
 
 
@@ -273,21 +278,26 @@ def gate_manifest(
     category-owned kinds (exclusive / model-provider), bundled auto-loads (backend now, platform deferred),
     then ``plugins.enabled`` opt-in (path-derived key or legacy bare name)."""
     lookup_key = manifest_key(manifest)
-    from hermes_cli.left_core_migration import legacy_plugin_keys
-    # A bundled key that left core (``observability/langfuse``) keeps selecting its catalog plugin.
-    names = {lookup_key, manifest.name, *legacy_plugin_keys(lookup_key)}
+    owners = manifest.selection_owners
+    installed_dir = Path(manifest.path).name if manifest.path else None
+    if owners is None:
+        owners = plugin_selection_owners({lookup_key: plugin_identity_names(lookup_key, manifest.name, installed_dir)})
+    claimed = plugin_identity_names(lookup_key, manifest.name, installed_dir)
+    names = {name for name in claimed if owners.get(name) == lookup_key}
+    # An ambiguous alias cannot grant a load, but an unresolved deny must keep its veto.
+    denied_names = names | {name for name in claimed if owners.get(name) is None}
 
     def _placeholder(error: Optional[str], level: int, message: str, *args, enabled: bool = False) -> ManifestGate:
         return ManifestGate("placeholder", enabled=enabled, error=error, log=(level, message, lookup_key, *args))
 
     # Relay lifecycle is core-owned; an old plugin copy would compete for its registries.
-    if names & LEGACY_RELAY_PLUGIN_KEYS:
+    if claimed & LEGACY_RELAY_PLUGIN_KEYS:
         error = (
             "removed — Relay lifecycle is owned by Hermes core; configure a standard user or system Relay "
             f"plugins.toml, or use {RELAY_PLUGINS_CONFIG_ENV} for an explicit user-file override"
         )
         return _placeholder(error, logging.WARNING, "Refusing to load removed Hermes Relay plugin '%s'; %s", error)
-    if names & disabled:
+    if denied_names & disabled:
         if enabled and names & enabled:
             # Contradictory config (#131980): the disable wins, but a silent DEBUG skip hides the
             # conflict — the plugin "loads nowhere" while plugins.enabled still lists it. Fail loud.

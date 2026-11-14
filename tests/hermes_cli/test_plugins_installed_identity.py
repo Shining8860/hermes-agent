@@ -23,28 +23,33 @@ def installed(tmp_path, monkeypatch):
 @pytest.mark.parametrize('nested', [False, True])
 @pytest.mark.parametrize('symlink', [False, True])
 def test_installed_key_matches_loader_and_pm(installed, tmp_path, suffix, nested, symlink):
-    key = 'custom/probe' if nested else 'probe'
-    source = tmp_path / 'source' if symlink else installed / 'plugins' / key
+    directory = 'custom/probe' if nested else 'probe'
+    source = tmp_path / 'source' if symlink else installed / 'plugins' / directory
     source.mkdir(parents=True)
     if suffix == 'json':
         (source / 'plugin.json').write_text(json.dumps({'$schema': PLUGIN_SCHEMA_V1, 'name': 'probe-manifest', 'version': '1.0.0'}))
     else:
         (source / f'plugin.{suffix}').write_text('name: probe-manifest\nversion: 1.0.0\n')
     (source / '__init__.py').write_text('def register(ctx): pass\n')
-    target = installed / 'plugins' / key
+    target = installed / 'plugins' / directory
     if symlink:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.symlink_to(source, target_is_directory=True)
     row = next(e for e in plugins_cmd._discover_all_plugins() if e[0] == 'probe-manifest')
     manifest = next(m for m in collect_directory_manifests() if m.name == 'probe-manifest')
+    # A native manifest is keyed by its installed directory; a portable package keeps the name it
+    # declares and accepts its directory as an alias.
+    key = 'probe-manifest' if (suffix == 'json' and not nested) else directory
     assert row[5] == manifest.key == key
     if suffix == 'json' and not nested:
         from hermes_cli.plugins_manifest import _portable_data_namespace
         assert manifest.data_namespace == _portable_data_namespace('probe-manifest')
     assert plugins_cmd._resolve_plugin_key(key) == key
     assert plugins_cmd._resolve_plugin_key('probe-manifest') == key
-    assert selected_plugin_dir(installed / 'plugins', key) == target
+    assert plugins_cmd._resolve_plugin_key(directory) == key
+    assert selected_plugin_dir(installed / 'plugins', directory) == target
     assert gate_manifest(manifest, set(), {key}).action == 'load'
+    assert gate_manifest(manifest, set(), {directory}).action == 'load'
 
 
 @pytest.mark.parametrize('enable', [True, False])
@@ -106,9 +111,78 @@ def test_cli_repairs_mixed_selection_without_another_alias(installed, monkeypatc
     assert cfg['enabled'] == [] and cfg['disabled'] == ['probe']
 
 
-def test_duplicate_manifest_alias_is_not_guessed(installed):
-    for directory in ['first', 'second']:
-        p = installed / 'plugins' / directory
-        p.mkdir()
-        (p / 'plugin.yaml').write_text('name: same-manifest\nversion: 1.0.0\n')
-    assert plugins_cmd._find_plugin_entry('same-manifest') is None
+def _identity_plugins(home, identities):
+    from hermes_cli.plugins_discovery import resolve_manifest_winners
+
+    for key, name in identities.items():
+        p = home / 'plugins' / key
+        p.mkdir(parents=True)
+        (p / 'plugin.yaml').write_text(f'name: {name}\nversion: 1.0.0\n')
+        (p / '__init__.py').write_text('def register(ctx): pass\n')
+    return resolve_manifest_winners([m for m in collect_directory_manifests() if m.source == 'user'])
+
+
+@pytest.mark.parametrize('other', ['aaa', 'category/probe'])
+@pytest.mark.parametrize('enable', [True, False])
+@pytest.mark.parametrize('foreign_list', ['enabled', 'disabled'])
+def test_canonical_selection_survives_foreign_alias_cleanup(installed, other, enable, foreign_list):
+    winners = _identity_plugins(installed, {'probe': 'own-name', other: 'probe'})
+    assert plugins_cmd._find_plugin_entry('probe')[5] == 'probe'
+    assert [key for key, m in winners.items() if gate_manifest(m, set(), {'probe'}).action == 'load'] == ['probe']
+    # A deny for the canonical plugin must not veto the other plugin either.
+    assert gate_manifest(winners[other], {'probe'}, {other}).action == 'load'
+    enabled = {'probe'} if foreign_list == 'enabled' else set()
+    disabled = {'probe'} if foreign_list == 'disabled' else set()
+    plugins_cmd._apply_activation(enabled, disabled, other, plugins_cmd._plugin_aliases(other), enable=enable)
+    assert ('probe' in enabled, 'probe' in disabled) == (foreign_list == 'enabled', foreign_list == 'disabled')
+    assert other in (enabled if enable else disabled)
+    assert other not in (disabled if enable else enabled)
+
+
+@pytest.mark.parametrize('identities, alias', [
+    ({'first': 'same-manifest', 'second': 'same-manifest'}, 'same-manifest'),
+    ({'first': 'probe', 'category/probe': 'other-name'}, 'probe'),
+    ({'one/probe': 'first-name', 'two/probe': 'second-name'}, 'probe'),
+])
+def test_ambiguous_alias_is_not_guessed_or_normalized(installed, identities, alias):
+    winners = _identity_plugins(installed, identities)
+    assert plugins_cmd._find_plugin_entry(alias) is None
+    assert not any(gate_manifest(m, set(), {alias}).action == 'load' for m in winners.values())
+    for key, m in winners.items():
+        # Ambiguous deny entries remain a veto until explicitly resolved, never a load grant.
+        assert gate_manifest(m, {alias}, {key}).action != 'load'
+        for enable in (True, False):
+            enabled, disabled = {alias}, {alias}
+            with pytest.raises(plugins_cmd.PluginOperationError, match='ambiguous'):
+                plugins_cmd._apply_activation(enabled, disabled, key, plugins_cmd._plugin_aliases(key), enable=enable)
+            assert (enabled, disabled) == ({alias}, {alias})
+
+
+@pytest.mark.parametrize('enable', [True, False])
+def test_mnemosyne_alias_mismatch_still_normalizes(installed, enable):
+    winners = _identity_plugins(installed, {'mnemosyne': 'hermes-mnemosyne'})
+    enabled, disabled = {'hermes-mnemosyne'}, {'mnemosyne'}
+    assert plugins_cmd._find_plugin_entry('hermes-mnemosyne')[5] == 'mnemosyne'
+    plugins_cmd._apply_activation(enabled, disabled, 'mnemosyne', plugins_cmd._plugin_aliases('mnemosyne'), enable=enable)
+    assert (enabled, disabled) == (({'mnemosyne'}, set()) if enable else (set(), {'mnemosyne'}))
+    assert (gate_manifest(winners['mnemosyne'], disabled, enabled).action == 'load') is enable
+
+
+def test_runtime_loads_only_the_selected_canonical_plugin(installed, tmp_path, monkeypatch):
+    """End-to-end loader check: enabling the canonical key must not import its alias owner."""
+    from hermes_cli import plugins as plugins_mod
+    from hermes_cli.plugins import PluginManager
+
+    _identity_plugins(installed, {'probe': 'own-name', 'aaa': 'probe'})
+    (installed / 'config.yaml').write_text('plugins:\n  enabled: [probe]\n  disabled: []\n')
+    bundled = tmp_path / 'bundled'
+    bundled.mkdir()
+    monkeypatch.setattr(plugins_mod, 'get_bundled_plugins_dir', lambda: bundled)
+
+    manager = PluginManager()
+    manager.discover_and_load()
+
+    assert manager._plugins['probe'].enabled is True
+    assert manager._plugins['aaa'].enabled is False
+    # And the CLI's own enable of the other plugin selects only that plugin at runtime.
+    assert plugins_cmd._find_plugin_entry('aaa')[5] == 'aaa'
