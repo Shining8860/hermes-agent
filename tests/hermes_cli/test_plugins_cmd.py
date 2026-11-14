@@ -902,7 +902,7 @@ def test_portable_manifest_is_visible_to_plugin_cli(tmp_path):
         "portable.test",
         "1.0.0",
         "Portable test plugin",
-        "portable.test",
+        "portable",
     )
 
 

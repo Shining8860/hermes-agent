@@ -1118,7 +1118,7 @@ hermes logs --level WARNING | grep -i plugin
 
 Common reasons a plugin doesn't appear:
 
-- **Not enabled in config** — plugins are opt-in. Run `hermes plugins enable <name>` (the name comes from the `plugins list` output, which can be `<category>/<plugin>` for nested layouts).
+- **Not enabled in config** — plugins are opt-in. Run `hermes plugins enable <name>` (the name comes from the `plugins list` output, which can be `<category>/<plugin>` for nested layouts). The persisted key is the installed directory name (including its category), even for a symlink; the manifest name remains an accepted input when unambiguous. Enabling or disabling normalizes both selection lists to that key; it does not migrate capability grants.
 - **Wrong directory layout:** Native packages use `~/.hermes/plugins/<plugin-name>/plugin.yaml` (flat) or one category level. Portable packages use root `plugin.json` in the same locations. Anything deeper is ignored.
 - **Missing `__init__.py`:** Native packages need both `plugin.yaml` and `__init__.py` with a `register(ctx)` function. Portable packages do not import Python and do not require `__init__.py`.
 - **Wrong `kind`** — gateway adapters need `kind: platform` in their manifest. Memory providers are auto-detected as `kind: exclusive` and routed through the `memory.provider` config instead of `plugins.enabled`.

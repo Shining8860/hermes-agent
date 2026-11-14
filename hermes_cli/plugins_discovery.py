@@ -228,7 +228,7 @@ def resolve_manifest_winners(manifests: list[PluginManifest]) -> dict[str, Plugi
     winners: dict[str, PluginManifest] = {}
     for manifest in manifests:
         key = manifest_key(manifest)
-        shadowed = winners.get(key)
+        shadowed = winners.get(key) or winners.get(manifest.name)
         if shadowed is not None and shadowed.source == "bundled" and manifest.source in {"user", "project"}:
             own_dir = Path(manifest.path).name if manifest.path else ""
             bundled_dir = Path(shadowed.path).name if shadowed.path else ""
@@ -236,7 +236,7 @@ def resolve_manifest_winners(manifests: list[PluginManifest]) -> dict[str, Plugi
                 logger.warning(
                     "Ignoring %s plugin at %s: its manifest name '%s' is a bundled plugin's key but the "
                     "directory is named '%s'; rename the directory to '%s' to override the bundled plugin",
-                    manifest.source, manifest.path, key, own_dir, bundled_dir,
+                    manifest.source, manifest.path, manifest.name, own_dir, bundled_dir,
                 )
                 continue
             logger.info("Plugin '%s' at %s (%s) shadows the bundled copy at %s", key, manifest.path,

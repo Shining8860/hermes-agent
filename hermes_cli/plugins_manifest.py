@@ -516,11 +516,13 @@ def portable_plugin_manifest(child: Path, source: str, prefix: str) -> PluginMan
     data, diagnostics = read_agent_plugin_manifest(child)
     for diagnostic in diagnostics:
         logger.warning("Agent Plugin '%s': %s", child, diagnostic.message)
-    key = f"{prefix}/{child.name}" if prefix else data["name"]
+    key = f"{prefix}/{child.name}" if prefix else child.name
+    # Selection normalization must not move existing portable plugin data.
+    namespace_key = key if prefix else data["name"]
     return PluginManifest(
         name=data["name"], version=data.get("version", ""), description=data.get("description", ""),
         author=_display_author(data.get("author", "")), source=source, path=str(child), key=key,
-        portable=True, data_namespace=_portable_data_namespace(key),
+        portable=True, data_namespace=_portable_data_namespace(namespace_key),
         config_schema=_config_schema_entries(key, manifest_config_schema(data)),
         config_keys=manifest_config_keys(manifest_hermes_extension(data), key),
     )
@@ -562,7 +564,7 @@ def parse_manifest_file(
                            manifest_file, type(data).__name__)
             return None
         name = data.get("name", plugin_dir.name)
-        key = f"{prefix}/{plugin_dir.name}" if prefix else name
+        key = f"{prefix}/{plugin_dir.name}" if prefix else plugin_dir.name
         kind = _manifest_kind(data, key, plugin_dir)
         logger.debug(
             "Parsed manifest: key=%s name=%s kind=%s source=%s path=%s", key, name, kind, source, plugin_dir)

@@ -571,7 +571,7 @@ def _plugin_aliases(key: str, entries: Optional[list] = None) -> set:
 
 
 def _activate_key(key: str, *, enable: bool, console=None) -> bool:
-    """Transactionally persist canonical *key*, purging aliases from the opposing list.
+    """Transactionally persist canonical *key*, purging aliases from both lists.
 
     False when the lists already say so (nothing written). PM owns the selection and dependency
     publication together, so every CLI/dashboard activation surface goes through the same admission
@@ -580,7 +580,8 @@ def _activate_key(key: str, *, enable: bool, console=None) -> bool:
     aliases = _plugin_aliases(key)
     target, other = (enabled, disabled) if enable else (disabled, enabled)
     # A plugin an update disabled is retried by later updates; disabling it yourself stops that.
-    if key in target and not (aliases & other) and not (not enable and _disabled_by_update(key, aliases)):
+    if (key in target and not ((aliases - {key}) & target) and not (aliases & other)
+            and not (not enable and _disabled_by_update(key, aliases))):
         return False
     _set_plugin_enabled(key, enable=enable, aliases=aliases, console=console)
     return True
@@ -670,11 +671,13 @@ def _refuse_recalled_entry(entry: Optional[tuple]) -> None:
 
 
 def _apply_activation(enabled: set, disabled: set, key: str, aliases, *, enable: bool) -> None:
-    """Add canonical *key* to the target list and purge it, its bare leaf and *aliases* from the other."""
+    """Keep only canonical *key* in the target list and purge its spellings from the other."""
     removed = disabled if enable else enabled
     _discard_key_and_leaf(removed, key)
     removed.difference_update(aliases)
-    (enabled if enable else disabled).add(key)
+    target = enabled if enable else disabled
+    target.difference_update(aliases)
+    target.add(key)
 
 
 def _resolve_plugin_key(name: str) -> Optional[str]:
@@ -708,7 +711,12 @@ def _find_plugin_entry(name: str) -> Optional[tuple]:
     entries = _discover_all_plugins()
     from hermes_cli.left_core_migration import legacy_plugin_alias
     target = legacy_plugin_alias(name) or name  # ``observability/langfuse`` -> its catalog plugin
-    exact = next((entry for entry in entries if target in (entry[0], entry[5])), None)
+    exact = next((entry for entry in entries if target == entry[5]), None)
+    if exact is None:
+        matches = [entry for entry in entries if target == entry[0]]
+        if len(matches) > 1:
+            return None
+        exact = matches[0] if matches else None
     if exact is not None:
         return exact
     leaf_matches = [entry for entry in entries if name == entry[5].split("/")[-1]]
@@ -819,7 +827,7 @@ def _read_manifest_info(d: Path, prefix: str):
         if not isinstance(manifest, dict):
             manifest = {}
         name = manifest.get("name", d.name)
-    key = f"{prefix}/{d.name}" if prefix else name
+    key = f"{prefix}/{d.name}" if prefix else d.name
     return name, manifest.get("version", ""), manifest.get("description", ""), key
 
 
