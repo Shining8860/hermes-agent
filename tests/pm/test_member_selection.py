@@ -214,7 +214,9 @@ def test_seed_lock_keeps_existing_deduplicated_buildable_member(tmp_path, packag
     )
     seed.write_text(seed_text, encoding="utf-8")
 
-    def check_sync(root, *, extras, frozen):
+    def check_sync(root, *, extras, frozen, upgrade):
+        # lock_and_sync forwards its uv -P policy; none was requested here.
+        assert upgrade == ()
         document = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
         assert document["tool"]["uv"]["workspace"]["members"] == [expected]
         assert (root / expected / "pyproject.toml").is_file()

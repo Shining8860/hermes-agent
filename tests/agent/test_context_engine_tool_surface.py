@@ -7,6 +7,10 @@ import pytest
 
 
 def schema(name):
+    if name == "delegate_task":
+        # The oneshot surface rewrites the real tasks.items shape; a synthetic one hides drift.
+        from tools.delegate_tool import DELEGATE_TASK_SCHEMA
+        return {"type": "function", "function": deepcopy(DELEGATE_TASK_SCHEMA)}
     return {"type": "function", "function": {
         "name": name, "description": name,
         "parameters": {"type": "object", "properties": {
@@ -35,6 +39,7 @@ def test_catalog_and_session_surface_keep_variants_and_session_drops(monkeypatch
     props = session[0]["function"]["parameters"]["properties"]
     assert ("action" not in props) is oneshot
     assert "tasks" in props
+    assert ("group" not in props["tasks"]["items"]["properties"]) is oneshot
     assert module._session_tool_defs(agent, session) == session
     assert module._session_tool_defs(agent, catalog) == catalog
     assert definitions == original
