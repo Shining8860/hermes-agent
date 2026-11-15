@@ -58,6 +58,26 @@ def test_generic_429_benches_only_the_rate_limited_model(pool, monkeypatch):
     assert resolve_anthropic_token() == KEY  # model-less diagnostics keep the key
 
 
+def test_model_cooldown_preserves_worker_retry_and_no_relogin(pool, monkeypatch):
+    from agent.primary_auth_fallback import primary_auth_failure_from_exc
+    from hermes_cli.auth import AuthError, is_rate_limited_auth_error
+    from hermes_cli.cli_single_query import _single_query_exit_code
+    from hermes_cli.runtime_provider import _anthropic_token_or_raise
+
+    pool.mark_exhausted_and_rotate(status_code=429, api_key_hint=KEY, model=MODEL_A)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", KEY)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fixture")
+    with pytest.raises(AuthError) as caught:
+        _anthropic_token_or_raise(model=MODEL_A)
+    error = caught.value
+    assert is_rate_limited_auth_error(error), "model cooldown must retain the worker quota discriminator"
+    assert error.provider == "anthropic" and error.retryable is True
+    assert not error.relogin_required
+    assert primary_auth_failure_from_exc(error, "anthropic", "custom") is None
+    assert _single_query_exit_code(None, credentials_rate_limited=is_rate_limited_auth_error(error)) == 75
+    assert _anthropic_token_or_raise(model=MODEL_B) == KEY
+
+
 @pytest.mark.parametrize("status_code, failure_reason", [(401, None), (402, "billing"), (429, "billing")])
 def test_auth_and_billing_failures_stay_credential_wide(pool, status_code, failure_reason):
     from agent.credential_pool import STATUS_EXHAUSTED
