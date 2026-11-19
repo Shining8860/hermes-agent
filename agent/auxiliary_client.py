@@ -141,7 +141,7 @@ from agent.auxiliary_unavailable import (
     AuxiliaryClientUnavailable, clear_nous_credential_failure, missing_provider_credentials_message,
     nous_credential_failure_detail, record_nous_credential_failure)
 from hermes_constants import OPENROUTER_BASE_URL, hermes_home_key
-from utils import base_url_host_matches, base_url_hostname, base_url_origin, base_url_path, env_float, is_truthy_value, model_forces_max_completion_tokens, normalize_proxy_env_vars
+from utils import base_url_host_matches, base_url_hostname, base_url_origin, base_url_path, env_float, is_truthy_value, normalize_proxy_env_vars
 
 logger = logging.getLogger(__name__)
 
@@ -1368,7 +1368,7 @@ class _CodexCompletionsAdapter:
             _responses_tools,
             _role_message_item,
             _wire_model_identity,
-            classify_responses_route,
+            apply_developer_instructions_if_needed, classify_responses_route,
         )
         from agent.transports.codex import _alias_wire_tools
         model = kwargs.get("model", self._model)
@@ -1501,8 +1501,8 @@ class _CodexCompletionsAdapter:
                     resp_kwargs["prompt_cache_retention"] = cache_retention
         except Exception:
             logger.debug("Codex auxiliary: prompt_cache_key derivation skipped", exc_info=True)
-        # Last, like the main transport: caller extra_body must not put a rejected Astra field back.
         from agent.transports.codex import _sanitize_astra_request_kwargs
+        apply_developer_instructions_if_needed(resp_kwargs, wire_model, is_xai_responses=is_xai)
         _sanitize_astra_request_kwargs(resp_kwargs, model, host)
         return resp_kwargs, model, timeout
 
@@ -5529,7 +5529,7 @@ def resolve_vision_provider_client(
 def auxiliary_max_tokens_param(value: int, *, model: Optional[str] = None) -> dict:
     """Max-tokens kwarg for the auxiliary provider: direct OpenAI, a custom endpoint whose profile declares
     it, and newer OpenAI-family models (by ``model`` name: custom endpoints fronting gpt-5.x) need max_completion_tokens."""
-    from agent.provider_route_hooks import route_answer
+    from agent.provider_route_hooks import model_forces_max_completion_tokens, route_answer
     _custom_base = _current_custom_base_url()
     direct_openai_family = not _scoped_key_env("OPENROUTER_API_KEY") and _read_nous_auth() is None and (
         base_url_hostname(_custom_base) == "api.openai.com"
@@ -7081,7 +7081,7 @@ class _ChatStreamAccumulator:
         if delta is None:
             return False
         made_progress = False
-        from agent.message_content import flatten_message_text
+        from session_rules.turns import flatten_message_text
 
         piece = flatten_message_text(getattr(delta, "content", None), sep="")
         if piece:
